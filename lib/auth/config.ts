@@ -6,6 +6,11 @@ import { users } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 
 export const authConfig: NextAuthConfig = {
+  // Required for non-Vercel hosts (e.g. Railway): Auth.js validates the
+  // request's Host header against the deployment's trusted hosts, and
+  // rejects the request otherwise. Vercel sets this automatically; we don't
+  // run there, so it must be set explicitly here.
+  trustHost: true,
   pages: {
     signIn: "/login",
   },
