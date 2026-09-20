@@ -32,20 +32,15 @@ COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
 
-# Next's file tracer misses drizzle-orm's node-postgres subpath export,
-# so it's absent from .next/standalone/node_modules despite being a real
-# runtime dependency of lib/db/client.ts — copy it explicitly or the
-# container crashes on first request.
-COPY --from=builder /app/node_modules/drizzle-orm ./node_modules/drizzle-orm
-COPY --from=builder /app/node_modules/@drizzle-team ./node_modules/@drizzle-team
-
-# drizzle-kit + its config/migrations are needed at runtime for the
-# migrate-then-start startup command (see start:prod). drizzle.config.ts
-# imports dotenv unconditionally (harmless no-op in production, where
-# .env.local doesn't exist and DATABASE_URL comes from Railway instead).
-COPY --from=builder /app/node_modules/drizzle-kit ./node_modules/drizzle-kit
-COPY --from=builder /app/node_modules/.bin/drizzle-kit ./node_modules/.bin/drizzle-kit
-COPY --from=builder /app/node_modules/dotenv ./node_modules/dotenv
+# Next's standalone tracer only includes what the Next.js server itself
+# needs at runtime, not drizzle-kit's CLI (used by start:prod to run
+# migrations) or drizzle-orm/node-postgres (a subpath export the tracer
+# misses despite it being a real runtime dependency of lib/db/client.ts).
+# Rather than hand-pick individual packages out of node_modules and risk
+# missing a transitive dependency (drizzle-kit alone pulls in esbuild,
+# @esbuild-kit/esm-loader, and tsx), copy the complete node_modules that
+# `npm ci` already resolved correctly in the deps stage.
+COPY --from=deps /app/node_modules ./node_modules
 COPY --from=builder /app/drizzle.config.ts ./drizzle.config.ts
 COPY --from=builder /app/drizzle ./drizzle
 COPY --from=builder /app/package.json ./package.json
