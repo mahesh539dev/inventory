@@ -6,8 +6,10 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "start:prod": "npm run db:migrate && node server.js",
     "lint": "eslint",
     "test": "vitest run",
+    "db:migrate": "drizzle-kit migrate",
     "db:seed": "dotenv run -f .env.local -- tsx scripts/seed.ts"
   },
   "dependencies": {

@@ -1,0 +1,12 @@
+node_modules
+.next
+.git
+.worktrees
+.superpowers
+docs
+*.md
+.env
+.env.local
+.env*.local
+npm-debug.log*
+.DS_Store
