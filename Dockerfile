@@ -10,6 +10,13 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
+# next build statically analyzes API routes, which imports lib/db/client.ts.
+# That file requires DATABASE_URL to construct a Pool at module load time.
+# Railway only injects real env vars into the running container, not the
+# build step, so this placeholder exists purely to satisfy that import
+# during the build — no connection is ever attempted at build time, and
+# the real DATABASE_URL from Railway takes over the moment the container starts.
+ENV DATABASE_URL="postgresql://placeholder:placeholder@localhost:5432/placeholder"
 RUN npm run build
 
 FROM node:20-alpine AS runner
