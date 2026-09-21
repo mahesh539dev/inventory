@@ -8,6 +8,7 @@ import {
   createProduct,
   updateProduct as serviceUpdateProduct,
   archiveProduct as serviceArchiveProduct,
+  regenerateProductQr,
   DuplicateSkuError,
   ProductNotFoundError,
 } from "@/lib/services/product.service";
@@ -106,4 +107,11 @@ export async function archiveProductAction(id: string): Promise<void> {
   }
   revalidatePath("/products");
   redirect("/products");
+}
+
+export async function regenerateProductQrAction(id: string): Promise<void> {
+  await requireAdmin();
+  await regenerateProductQr(id);
+  revalidatePath(`/products/${id}`);
+  redirect(`/products/${id}`);
 }
