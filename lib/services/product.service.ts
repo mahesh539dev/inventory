@@ -30,6 +30,16 @@ async function resolveCategoryId(categoryName: string): Promise<string | undefin
   return category.id;
 }
 
+// Unlike resolveCategoryId (used on create, where "no category" means "omit the
+// field"), an update must be able to express "clear the category" explicitly.
+// Drizzle's update builder drops `undefined` values from the SET clause, so
+// returning `undefined` here would silently leave the old categoryId in place.
+async function resolveCategoryIdForUpdate(categoryName: string): Promise<string | null> {
+  if (!categoryName || categoryName.trim().length === 0) return null;
+  const category = await findOrCreateCategory(categoryName);
+  return category.id;
+}
+
 export async function createProduct(input: CreateProductInput): Promise<ProductRow> {
   const existing = await findProductBySku(input.sku);
   if (existing) {
@@ -60,7 +70,7 @@ export async function updateProduct(id: string, input: UpdateProductInput): Prom
     throw new ProductNotFoundError(id);
   }
 
-  const categoryId = await resolveCategoryId(input.categoryName);
+  const categoryId = await resolveCategoryIdForUpdate(input.categoryName);
 
   return repoUpdateProduct(id, {
     productName: input.productName,

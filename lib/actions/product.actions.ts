@@ -9,6 +9,7 @@ import {
   updateProduct as serviceUpdateProduct,
   archiveProduct as serviceArchiveProduct,
   DuplicateSkuError,
+  ProductNotFoundError,
 } from "@/lib/services/product.service";
 
 export type ProductFormState = { error?: string; fieldErrors?: Record<string, string> } | undefined;
@@ -73,7 +74,14 @@ export async function updateProductAction(
     };
   }
 
-  await serviceUpdateProduct(id, parsed.data);
+  try {
+    await serviceUpdateProduct(id, parsed.data);
+  } catch (error) {
+    if (error instanceof ProductNotFoundError) {
+      return { error: "This product no longer exists." };
+    }
+    throw error;
+  }
 
   revalidatePath("/products");
   revalidatePath(`/products/${id}`);
@@ -82,7 +90,20 @@ export async function updateProductAction(
 
 export async function archiveProductAction(id: string): Promise<void> {
   await requireAdmin();
-  await serviceArchiveProduct(id);
+  try {
+    await serviceArchiveProduct(id);
+  } catch (error) {
+    if (error instanceof ProductNotFoundError) {
+      // archiveProductAction has no form-state contract to report a field
+      // error through (unlike createProductAction/updateProductAction), so
+      // the cleanest behavior for an already-gone product is to redirect to
+      // the list as if the archive succeeded — the desired end state (the
+      // product not appearing as active) already holds.
+      revalidatePath("/products");
+      redirect("/products");
+    }
+    throw error;
+  }
   revalidatePath("/products");
   redirect("/products");
 }
