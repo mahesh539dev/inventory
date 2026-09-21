@@ -15,6 +15,50 @@ export async function findProductById(id: string): Promise<ProductRow | undefine
   return row;
 }
 
+export type PublicProductView = {
+  productName: string;
+  sellingPrice: string | null;
+  productImage: string | null;
+};
+
+export async function findPublicProductView(
+  publicIdentifier: string
+): Promise<PublicProductView | undefined> {
+  const [row] = await db
+    .select({
+      productName: products.productName,
+      sellingPrice: products.sellingPrice,
+      productImage: products.productImage,
+    })
+    .from(products)
+    .where(eq(products.publicIdentifier, publicIdentifier))
+    .limit(1);
+  return row;
+}
+
+export async function findProductByPublicIdentifier(
+  publicIdentifier: string
+): Promise<ProductRow | undefined> {
+  const [row] = await db
+    .select()
+    .from(products)
+    .where(eq(products.publicIdentifier, publicIdentifier))
+    .limit(1);
+  return row;
+}
+
+export async function regeneratePublicIdentifier(
+  id: string,
+  newIdentifier: string
+): Promise<ProductRow> {
+  const [row] = await db
+    .update(products)
+    .set({ publicIdentifier: newIdentifier, updatedAt: new Date() })
+    .where(eq(products.id, id))
+    .returning();
+  return row;
+}
+
 export async function insertProduct(data: NewProduct): Promise<ProductRow> {
   const [row] = await db.insert(products).values(data).returning();
   return row;
