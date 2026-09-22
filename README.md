@@ -65,3 +65,14 @@ docker run -p 3000:3000 \
   -e APP_URL="http://localhost:3000" \
   inventory-app
 ```
+
+## QR System
+
+Each product can generate a unique QR code that points to its public product page. When someone scans the QR code, they land on the product's public view at `/p/[publicIdentifier]`:
+
+- **Public visitor** — sees a restricted view with product image, name, and selling price.
+- **Logged-in user** — sees the full internal product record (including SKU, status, quantity, cost price, supplier, location, description, and notes).
+
+**Important:** The `APP_URL` environment variable must be set to the correct production domain. This is used to generate the QR code's URL; if `APP_URL` is incorrect, printed QR codes will resolve to the wrong domain in the field.
+
+**Regenerating a QR code** invalidates all previously printed copies. If you regenerate a product's QR code, you must reprint any copies that were already distributed, or they will no longer scan to the correct product.

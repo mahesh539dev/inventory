@@ -5,6 +5,7 @@ import { findProductById } from "@/lib/repositories/product.repo";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ArchiveProductButton } from "@/components/products/ArchiveProductButton";
+import { RegenerateQrButton } from "@/components/products/RegenerateQrButton";
 
 export default async function ProductDetailsPage({ params }: { params: Promise<{ id: string }> }) {
   const user = await requireUser();
@@ -50,6 +51,22 @@ export default async function ProductDetailsPage({ params }: { params: Promise<{
           </>
         )}
       </dl>
+
+      <div className="space-y-2 border-t pt-4">
+        <h2 className="text-sm font-medium text-muted-foreground">QR Code</h2>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={`/api/products/${product.id}/qr`}
+          alt={`QR code for ${product.productName}`}
+          width={200}
+          height={200}
+          className="rounded-md border"
+        />
+        <div className="flex flex-wrap gap-2">
+          <Button variant="outline" render={<a href={`/api/products/${product.id}/qr?download=1`}>Download PNG</a>} />
+          {user.role === "ADMIN" && <RegenerateQrButton productId={product.id} />}
+        </div>
+      </div>
 
       {product.description && (
         <div>

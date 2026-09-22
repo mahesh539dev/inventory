@@ -5,6 +5,7 @@ import {
   updateProduct as repoUpdateProduct,
   archiveProduct as repoArchiveProduct,
   findProductById,
+  regeneratePublicIdentifier,
   type ProductRow,
 } from "@/lib/repositories/product.repo";
 import { findOrCreateCategory } from "@/lib/repositories/category.repo";
@@ -91,4 +92,12 @@ export async function archiveProduct(id: string): Promise<ProductRow> {
     throw new ProductNotFoundError(id);
   }
   return repoArchiveProduct(id);
+}
+
+export async function regenerateProductQr(id: string): Promise<ProductRow> {
+  const existing = await findProductById(id);
+  if (!existing) {
+    throw new ProductNotFoundError(id);
+  }
+  return regeneratePublicIdentifier(id, nanoid(10));
 }
