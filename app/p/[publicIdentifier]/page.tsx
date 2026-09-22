@@ -81,6 +81,13 @@ export default async function PublicProductPage({
           <p>{product.description}</p>
         </div>
       )}
+
+      {product.notes && (
+        <div>
+          <h2 className="text-sm font-medium text-muted-foreground">Notes</h2>
+          <p>{product.notes}</p>
+        </div>
+      )}
     </div>
   );
 }
