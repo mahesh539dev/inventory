@@ -54,6 +54,7 @@ export default async function ProductDetailsPage({ params }: { params: Promise<{
 
       <div className="space-y-2 border-t pt-4">
         <h2 className="text-sm font-medium text-muted-foreground">QR Code</h2>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={`/api/products/${product.id}/qr`}
           alt={`QR code for ${product.productName}`}

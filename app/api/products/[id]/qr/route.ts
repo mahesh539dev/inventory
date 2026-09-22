@@ -25,6 +25,7 @@ export async function GET(
       "Content-Disposition": isDownload
         ? `attachment; filename="${product.sku}-qr.png"`
         : "inline",
+      "Cache-Control": "no-store",
     },
   });
 }
