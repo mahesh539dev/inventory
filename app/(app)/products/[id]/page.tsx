@@ -52,6 +52,13 @@ export default async function ProductDetailsPage({ params }: { params: Promise<{
         )}
       </dl>
 
+      <div>
+        <Button
+          variant="outline"
+          render={<Link href={`/products/${product.id}/history`}>View History</Link>}
+        />
+      </div>
+
       <div className="space-y-2 border-t pt-4">
         <h2 className="text-sm font-medium text-muted-foreground">QR Code</h2>
         {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -85,6 +92,10 @@ export default async function ProductDetailsPage({ params }: { params: Promise<{
       {user.role === "ADMIN" && product.status === "ACTIVE" && (
         <div className="flex gap-2 pt-2">
           <Button render={<Link href={`/products/${product.id}/edit`}>Edit</Link>} />
+          <Button
+            variant="outline"
+            render={<Link href={`/products/${product.id}/adjust`}>Adjust Stock</Link>}
+          />
           <ArchiveProductButton productId={product.id} />
         </div>
       )}
