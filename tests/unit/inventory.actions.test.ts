@@ -6,7 +6,11 @@ vi.mock("@/lib/auth/guards", () => ({
 
 vi.mock("@/lib/services/inventory.service", () => ({
   adjustInventory: vi.fn(),
-  InsufficientInventoryError: class InsufficientInventoryError extends Error {},
+  InsufficientInventoryError: class InsufficientInventoryError extends Error {
+    constructor(productId: string, attemptedQuantity: number) {
+      super(`Adjustment would result in negative inventory for product ${productId} (would be ${attemptedQuantity})`);
+    }
+  },
 }));
 
 vi.mock("@/lib/services/product.service", () => ({
@@ -71,7 +75,7 @@ describe("adjustInventoryAction", () => {
   it("maps InsufficientInventoryError to a field error, not a thrown exception", async () => {
     vi.mocked(requireAdmin).mockResolvedValue({ id: "1", role: "ADMIN", email: "a@example.com" });
     vi.mocked(adjustInventory).mockRejectedValue(
-      new InsufficientInventoryError("prod-1 would go negative")
+      new InsufficientInventoryError("prod-1", -999)
     );
 
     const result = await adjustInventoryAction("prod-1", undefined, buildFormData({ quantityDelta: "-999" }));
