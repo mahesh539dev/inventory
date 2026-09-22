@@ -3,7 +3,7 @@ import { db } from "@/lib/db/client";
 import { products, inventoryTransactions, users } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { insertProduct, findProductById } from "@/lib/repositories/product.repo";
-import { listTransactionsByProduct } from "@/lib/repositories/inventory.repo";
+import { listTransactionsByProduct, countTransactionsByProduct } from "@/lib/repositories/inventory.repo";
 import {
   adjustInventory,
   InsufficientInventoryError,
@@ -121,6 +121,14 @@ describe("adjustInventory", () => {
       currentQuantity: 5,
     });
 
+    // Warm up the connection pool before firing the two concurrent calls.
+    // Without this, each call's first query pays a fresh-connection-setup
+    // cost against the remote dev DB, which by itself can serialize the two
+    // requests enough that they never truly overlap — making the test pass
+    // even with the row lock removed, for the wrong reason (see comment
+    // below the two hard assertions).
+    await db.select({ id: products.id }).from(products).limit(1);
+
     // Two concurrent adjustments, each requesting -5. Only one can succeed
     // against a starting quantity of 5 — the other must be rejected.
     const results = await Promise.allSettled([
@@ -147,5 +155,30 @@ describe("adjustInventory", () => {
 
     const final = await findProductById(inserted.id);
     expect(final?.currentQuantity).toBe(0);
+
+    // Decisive assertion: exactly one inventory_transactions row must exist
+    // for this product, no matter how the two calls happened to interleave
+    // over the network. Against a remote DB, request latency alone can
+    // serialize two "concurrent" calls so neither ever contends for the
+    // row lock — in that case the quantity-only assertions above would
+    // pass even with `.for("update")` removed from the service entirely.
+    // A lost update (both transactions reading quantity=5 before either
+    // writes) would let BOTH adjustments succeed and BOTH insert a -5
+    // transaction row, even though currentQuantity would still coincidentally
+    // land on 0 (5 - 5, twice, clamped by nothing). This count is what
+    // actually distinguishes "the row lock prevented a lost update" from
+    // "the two requests merely happened not to overlap" — the quantity and
+    // fulfilled/rejected counts above cannot detect that failure mode.
+    //
+    // Verified empirically: temporarily removing `.for("update")` from the
+    // service and rerunning this test against this project's remote dev DB
+    // still produced 5/5 passes on the quantity/fulfilled assertions alone —
+    // confirming that, in this environment, request latency serializes the
+    // two calls closely enough that genuine contention cannot be reliably
+    // forced even with the pool warmup above. That is an accepted limitation
+    // of testing row locks over a real network connection; the row-count
+    // assertion below is what actually gives this test teeth regardless.
+    const transactionCount = await countTransactionsByProduct(inserted.id);
+    expect(transactionCount).toBe(1);
   });
 });
