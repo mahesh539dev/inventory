@@ -111,7 +111,26 @@ describe("adjustInventory", () => {
     ).rejects.toThrow(ProductNotFoundError);
   });
 
-  it("never allows quantity to go negative under concurrent adjustments", async () => {
+  it("real-world sanity check: two sequential-in-effect concurrent adjustments never take quantity negative", async () => {
+    // This does NOT reliably reproduce genuine row-lock contention against
+    // the real dev DB — extensive diagnosis (isolating pool connection
+    // acquisition, Drizzle's transaction wrapper, raw SQL execution via
+    // tx.execute, updates to different rows, and connection warmup) showed
+    // that two concurrent db.update()/db.transaction() calls against this
+    // specific Railway instance serialize by roughly 1-1.5 seconds for
+    // reasons outside this service's control (not the row lock: even
+    // updates to two DIFFERENT rows with no shared lock at all showed the
+    // same gap; raw pg.Pool.connect() and raw SQL pg_sleep via Drizzle's
+    // own tx.execute both proved genuinely concurrent). The mechanism was
+    // never isolated further given time constraints — it may be specific
+    // to this Railway proxy/connection setup — so a real-DB test cannot be
+    // trusted to exercise the actual race. See the mocked test below for a
+    // deterministic proof of the locking logic itself.
+    //
+    // This test is kept as a smoke check only: it confirms the service
+    // still behaves sanely (one succeeds, one is rejected, final quantity
+    // is correct, exactly one transaction row) when called this way — it
+    // does not prove the row lock caused that outcome.
     const inserted = await insertProduct({
       publicIdentifier: "test-inv-svc-concur-pubid-001",
       sku: CONCURRENCY_SKU,
@@ -121,16 +140,6 @@ describe("adjustInventory", () => {
       currentQuantity: 5,
     });
 
-    // Warm up the connection pool before firing the two concurrent calls.
-    // Without this, each call's first query pays a fresh-connection-setup
-    // cost against the remote dev DB, which by itself can serialize the two
-    // requests enough that they never truly overlap — making the test pass
-    // even with the row lock removed, for the wrong reason (see comment
-    // below the two hard assertions).
-    await db.select({ id: products.id }).from(products).limit(1);
-
-    // Two concurrent adjustments, each requesting -5. Only one can succeed
-    // against a starting quantity of 5 — the other must be rejected.
     const results = await Promise.allSettled([
       adjustInventory({
         productId: inserted.id,
@@ -156,28 +165,6 @@ describe("adjustInventory", () => {
     const final = await findProductById(inserted.id);
     expect(final?.currentQuantity).toBe(0);
 
-    // Decisive assertion: exactly one inventory_transactions row must exist
-    // for this product, no matter how the two calls happened to interleave
-    // over the network. Against a remote DB, request latency alone can
-    // serialize two "concurrent" calls so neither ever contends for the
-    // row lock — in that case the quantity-only assertions above would
-    // pass even with `.for("update")` removed from the service entirely.
-    // A lost update (both transactions reading quantity=5 before either
-    // writes) would let BOTH adjustments succeed and BOTH insert a -5
-    // transaction row, even though currentQuantity would still coincidentally
-    // land on 0 (5 - 5, twice, clamped by nothing). This count is what
-    // actually distinguishes "the row lock prevented a lost update" from
-    // "the two requests merely happened not to overlap" — the quantity and
-    // fulfilled/rejected counts above cannot detect that failure mode.
-    //
-    // Verified empirically: temporarily removing `.for("update")` from the
-    // service and rerunning this test against this project's remote dev DB
-    // still produced 5/5 passes on the quantity/fulfilled assertions alone —
-    // confirming that, in this environment, request latency serializes the
-    // two calls closely enough that genuine contention cannot be reliably
-    // forced even with the pool warmup above. That is an accepted limitation
-    // of testing row locks over a real network connection; the row-count
-    // assertion below is what actually gives this test teeth regardless.
     const transactionCount = await countTransactionsByProduct(inserted.id);
     expect(transactionCount).toBe(1);
   });
