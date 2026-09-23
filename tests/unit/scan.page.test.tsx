@@ -114,4 +114,63 @@ describe("ScanPage", () => {
 
     expect(resolveProductForScan).not.toHaveBeenCalled();
   });
+
+  it("ignores a second decode fired while the first is still resolving", async () => {
+    let resolveFirst!: (value: { id: string } | null) => void;
+    vi.mocked(resolveProductForScan).mockImplementation(
+      () => new Promise((resolve) => { resolveFirst = resolve; })
+    );
+
+    render(<ScanPage />);
+
+    capturedOnDecode!("https://example.com/p/abc123");
+    capturedOnDecode!("https://example.com/p/different-code");
+
+    expect(resolveProductForScan).toHaveBeenCalledTimes(1);
+    expect(resolveProductForScan).toHaveBeenCalledWith({ publicIdentifier: "abc123" });
+
+    resolveFirst({ id: "prod-1" });
+    await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(1));
+    expect(pushMock).toHaveBeenCalledWith("/products/prod-1");
+  });
+
+  it("ignores a manual SKU submit fired while a decode is still resolving", async () => {
+    let resolveFirst!: (value: { id: string } | null) => void;
+    vi.mocked(resolveProductForScan).mockImplementation(
+      () => new Promise((resolve) => { resolveFirst = resolve; })
+    );
+
+    render(<ScanPage />);
+
+    capturedOnDecode!("https://example.com/p/abc123");
+    fireEvent.change(screen.getByLabelText(/sku/i), { target: { value: "SKU-999" } });
+    fireEvent.click(screen.getByRole("button", { name: /find product/i }));
+
+    expect(resolveProductForScan).toHaveBeenCalledTimes(1);
+    expect(resolveProductForScan).toHaveBeenCalledWith({ publicIdentifier: "abc123" });
+
+    resolveFirst({ id: "prod-1" });
+    await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(1));
+    expect(pushMock).toHaveBeenCalledWith("/products/prod-1");
+  });
+
+  it("allows a new decode after a not-found result clears the in-flight guard", async () => {
+    vi.mocked(resolveProductForScan)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "prod-3" });
+
+    render(<ScanPage />);
+
+    capturedOnDecode!("https://example.com/p/does-not-exist");
+    await waitFor(() =>
+      expect(
+        screen.getByText("Product not found — it may have been removed or its QR code regenerated.")
+      ).toBeInTheDocument()
+    );
+
+    capturedOnDecode!("https://example.com/p/abc123");
+
+    await waitFor(() => expect(pushMock).toHaveBeenCalledWith("/products/prod-3"));
+    expect(resolveProductForScan).toHaveBeenCalledTimes(2);
+  });
 });

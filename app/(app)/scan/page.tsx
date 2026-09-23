@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { QrScanner } from "@/components/scan/QrScanner";
 import { parseQrPayload } from "@/lib/scan/parse-qr-payload";
@@ -18,8 +18,10 @@ export default function ScanPage() {
   const [error, setError] = useState<string | null>(null);
   const [sku, setSku] = useState("");
   const [isPending, startTransition] = useTransition();
+  const resolvingRef = useRef(false);
 
   function handleResolved(result: { id: string } | null) {
+    resolvingRef.current = false;
     if (result) {
       router.push(`/products/${result.id}`);
       return;
@@ -29,12 +31,15 @@ export default function ScanPage() {
   }
 
   function handleDecode(text: string) {
+    if (resolvingRef.current) return;
+
     const parsed = parseQrPayload(text);
     if (!parsed) {
       setError(NOT_RECOGNIZED_ERROR);
       return;
     }
 
+    resolvingRef.current = true;
     setError(null);
     setPaused(true);
     startTransition(async () => {
@@ -44,10 +49,14 @@ export default function ScanPage() {
   }
 
   function handleManualSubmit() {
+    if (resolvingRef.current) return;
+
     const trimmed = sku.trim();
     if (trimmed.length === 0) return;
 
+    resolvingRef.current = true;
     setError(null);
+    setPaused(true);
     startTransition(async () => {
       const result = await resolveProductForScan({ sku: trimmed });
       handleResolved(result);
@@ -74,6 +83,7 @@ export default function ScanPage() {
             value={sku}
             onChange={(event) => setSku(event.target.value)}
             placeholder="SKU"
+            disabled={isPending}
           />
           <Button type="button" onClick={handleManualSubmit} disabled={isPending}>
             Find Product
