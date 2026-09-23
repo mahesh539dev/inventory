@@ -1,11 +1,12 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
-const { decodeFromVideoDeviceMock, stopContinuousDecodeMock } = vi.hoisted(() => ({
+const { decodeFromVideoDeviceMock, stopContinuousDecodeMock, controlsStopMock } = vi.hoisted(() => ({
   decodeFromVideoDeviceMock: vi.fn(),
   stopContinuousDecodeMock: vi.fn(),
+  controlsStopMock: vi.fn(),
 }));
 
 vi.mock("@zxing/browser", () => {
@@ -29,9 +30,11 @@ describe("QrScanner", () => {
   beforeEach(() => {
     decodeFromVideoDeviceMock.mockReset();
     stopContinuousDecodeMock.mockReset();
+    controlsStopMock.mockReset();
   });
 
   afterEach(() => {
+    cleanup();
     // @ts-expect-error -- test cleanup of a property we defined per-test
     delete window.navigator.mediaDevices;
   });
@@ -66,11 +69,27 @@ describe("QrScanner", () => {
     mockGetUserMedia(() =>
       Promise.resolve({ getTracks: () => [] } as unknown as MediaStream)
     );
-    decodeFromVideoDeviceMock.mockResolvedValue(undefined);
+    decodeFromVideoDeviceMock.mockResolvedValue({ stop: controlsStopMock });
 
     render(<QrScanner onDecode={vi.fn()} />);
 
     await waitFor(() => expect(screen.getByTestId("qr-video")).toBeInTheDocument());
+  });
+
+  it("stops the scan loop's controls on unmount, not just the camera stream", async () => {
+    mockGetUserMedia(() =>
+      Promise.resolve({ getTracks: () => [] } as unknown as MediaStream)
+    );
+    decodeFromVideoDeviceMock.mockResolvedValue({ stop: controlsStopMock });
+
+    const { unmount } = render(<QrScanner onDecode={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByTestId("qr-video")).toBeInTheDocument());
+
+    unmount();
+
+    expect(controlsStopMock).toHaveBeenCalledTimes(1);
+    expect(stopContinuousDecodeMock).toHaveBeenCalledTimes(1);
   });
 
   it("calls onDecode with the decoded text", async () => {
@@ -81,7 +100,7 @@ describe("QrScanner", () => {
     decodeFromVideoDeviceMock.mockImplementation(
       async (_deviceId: string, _video: unknown, callback: (result: { getText: () => string } | undefined) => void) => {
         callback({ getText: () => "abc123" });
-        return undefined;
+        return { stop: controlsStopMock };
       }
     );
 
@@ -99,7 +118,7 @@ describe("QrScanner", () => {
       async (_deviceId: string, _video: unknown, callback: (result: { getText: () => string } | undefined) => void) => {
         callback({ getText: () => "abc123" });
         callback({ getText: () => "abc123" });
-        return undefined;
+        return { stop: controlsStopMock };
       }
     );
 

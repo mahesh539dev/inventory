@@ -23,6 +23,7 @@ export function QrScanner({ onDecode, paused = false }: QrScannerProps) {
 
     const reader = new BrowserQRCodeReader();
     let cancelled = false;
+    let controls: { stop: () => void } | undefined;
 
     reader
       .decodeFromVideoDevice(undefined, videoRef.current!, (result) => {
@@ -32,8 +33,13 @@ export function QrScanner({ onDecode, paused = false }: QrScannerProps) {
         lastDecodedRef.current = text;
         onDecode(text);
       })
-      .then(() => {
-        if (!cancelled) setState("granted");
+      .then((scannerControls) => {
+        if (cancelled) {
+          scannerControls.stop();
+          return;
+        }
+        controls = scannerControls;
+        setState("granted");
       })
       .catch((error: unknown) => {
         if (cancelled) return;
@@ -46,6 +52,7 @@ export function QrScanner({ onDecode, paused = false }: QrScannerProps) {
 
     return () => {
       cancelled = true;
+      controls?.stop();
       BrowserQRCodeReader.releaseAllStreams();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onDecode identity intentionally excluded; reader is set up once per mount
