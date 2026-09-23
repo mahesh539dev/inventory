@@ -3,9 +3,7 @@ import Link from "next/link";
 import { requireUser } from "@/lib/auth/guards";
 import { findProductById } from "@/lib/repositories/product.repo";
 import { listTransactionsByProduct, countTransactionsByProduct } from "@/lib/repositories/inventory.repo";
-import { db } from "@/lib/db/client";
-import { users } from "@/lib/db/schema";
-import { inArray } from "drizzle-orm";
+import { findUserNamesByIds } from "@/lib/repositories/user.repo";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,10 +40,7 @@ export default async function InventoryHistoryPage({
   ]);
 
   const userIds = [...new Set(transactions.map((t) => t.createdBy))];
-  const userRows = userIds.length
-    ? await db.select({ id: users.id, name: users.name }).from(users).where(inArray(users.id, userIds))
-    : [];
-  const userNameById = new Map(userRows.map((u) => [u.id, u.name]));
+  const userNameById = await findUserNamesByIds(userIds);
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 

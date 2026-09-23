@@ -13,7 +13,7 @@ export default async function AdjustInventoryPage({
   const { id } = await params;
 
   const product = await findProductById(id);
-  if (!product) notFound();
+  if (!product || product.status !== "ACTIVE") notFound();
 
   const boundAction = adjustInventoryAction.bind(null, id);
 

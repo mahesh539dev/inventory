@@ -74,6 +74,7 @@ describe("adjustInventory — deterministic lost-update simulation", () => {
     const secondSelectGate = new Promise<void>((resolve) => {
       releaseSecondSelect = resolve;
     });
+    let capturedLockStrength: string | undefined;
 
     vi.mocked(db.transaction).mockImplementation(async (callback) => {
       const isFirstCall = !firstTransactionStarted;
@@ -91,7 +92,10 @@ describe("adjustInventory — deterministic lost-update simulation", () => {
         select: () => ({
           from: () => ({
             where: () => ({
-              for: () => Promise.resolve([{ ...mockProduct, currentQuantity: sharedQuantity }]),
+              for: (strength: string) => {
+                capturedLockStrength = strength;
+                return Promise.resolve([{ ...mockProduct, currentQuantity: sharedQuantity }]);
+              },
             }),
           }),
         }),
@@ -150,6 +154,12 @@ describe("adjustInventory — deterministic lost-update simulation", () => {
     expect(insertInventoryTransaction).toHaveBeenCalledTimes(1);
 
     expect(sharedQuantity).toBe(0);
+
+    // Proves this test would catch a regression from `.for("update")` to a
+    // weaker lock strength (e.g. `.for("share")`) in the real service — a
+    // real Postgres lock-strength bug, since SHARE locks don't prevent
+    // concurrent reads the way UPDATE locks do.
+    expect(capturedLockStrength).toBe("update");
   });
 
   it("demonstrates the lost-update bug this locking exists to prevent, when reads are NOT serialized", async () => {
@@ -162,6 +172,7 @@ describe("adjustInventory — deterministic lost-update simulation", () => {
     // call the real service's locking behavior differently, it changes
     // what the fake `tx` returns to simulate the row lock being absent.
     let sharedQuantity = 5;
+    let capturedLockStrength: string | undefined;
 
     vi.mocked(db.transaction).mockImplementation(async (callback) => {
       // No gate here — both calls' selects race freely, and since this
@@ -172,7 +183,10 @@ describe("adjustInventory — deterministic lost-update simulation", () => {
         select: () => ({
           from: () => ({
             where: () => ({
-              for: () => Promise.resolve([{ ...mockProduct, currentQuantity: sharedQuantity }]),
+              for: (strength: string) => {
+                capturedLockStrength = strength;
+                return Promise.resolve([{ ...mockProduct, currentQuantity: sharedQuantity }]);
+              },
             }),
           }),
         }),
@@ -216,5 +230,6 @@ describe("adjustInventory — deterministic lost-update simulation", () => {
     // reports "1 fulfilled" regardless of locking behavior.
     expect(fulfilled.length).toBe(2);
     expect(insertInventoryTransaction).toHaveBeenCalledTimes(2);
+    expect(capturedLockStrength).toBe("update");
   });
 });
