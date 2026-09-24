@@ -7,6 +7,7 @@ vi.mock("@/lib/auth/guards", () => ({
 vi.mock("@/lib/repositories/product.repo", () => ({
   findProductByPublicIdentifier: vi.fn(),
   findProductBySku: vi.fn(),
+  listProducts: vi.fn(),
 }));
 
 vi.mock("@/lib/services/sale.service", () => ({
@@ -15,9 +16,10 @@ vi.mock("@/lib/services/sale.service", () => ({
 }));
 
 import { requireUser } from "@/lib/auth/guards";
-import { findProductByPublicIdentifier, findProductBySku } from "@/lib/repositories/product.repo";
+import { findProductByPublicIdentifier, findProductBySku, listProducts } from "@/lib/repositories/product.repo";
 import { completeSale } from "@/lib/services/sale.service";
 import { lookupProductForSale, completeSaleAction } from "@/lib/actions/sale.actions";
+import { searchProductsForSale } from "@/lib/actions/product-search.actions";
 
 const sessionUser = { id: "user-1", role: "USER" as const, email: "a@example.com" };
 
@@ -142,5 +144,65 @@ describe("completeSaleAction", () => {
       userId: "user-1",
     });
     expect(result).toEqual({ saleId: "sale-1", saleNumber: "SALE-000001" });
+  });
+});
+
+describe("searchProductsForSale", () => {
+  beforeEach(() => {
+    vi.mocked(requireUser).mockReset();
+    vi.mocked(listProducts).mockReset();
+  });
+
+  it("requires authentication", async () => {
+    vi.mocked(requireUser).mockRejectedValue(new Error("not authenticated"));
+
+    await expect(searchProductsForSale("widget")).rejects.toThrow("not authenticated");
+    expect(listProducts).not.toHaveBeenCalled();
+  });
+
+  it("searches across all statuses (archived products are sellable) and shapes results", async () => {
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+    vi.mocked(listProducts).mockResolvedValue([
+      {
+        id: "prod-1",
+        productName: "Widget A",
+        sku: "SKU-A",
+        sellingPrice: "9.99",
+        currentQuantity: 5,
+        status: "ACTIVE",
+      },
+      {
+        id: "prod-2",
+        productName: "Widget B",
+        sku: "SKU-B",
+        sellingPrice: "12.00",
+        currentQuantity: 0,
+        status: "ARCHIVED",
+      },
+    ] as never);
+
+    const results = await searchProductsForSale("widget");
+
+    expect(listProducts).toHaveBeenCalledWith(
+      expect.objectContaining({ search: "widget", status: undefined })
+    );
+    expect(results).toHaveLength(2);
+    expect(results[0]).toEqual({
+      id: "prod-1",
+      productName: "Widget A",
+      sku: "SKU-A",
+      sellingPrice: "9.99",
+      currentQuantity: 5,
+      status: "ACTIVE",
+    });
+  });
+
+  it("returns an empty array for a blank query without calling listProducts", async () => {
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+
+    const results = await searchProductsForSale("   ");
+
+    expect(results).toEqual([]);
+    expect(listProducts).not.toHaveBeenCalled();
   });
 });
