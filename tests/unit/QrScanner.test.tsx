@@ -126,4 +126,50 @@ describe("QrScanner", () => {
 
     await waitFor(() => expect(onDecode).toHaveBeenCalledTimes(1));
   });
+
+  it("allows an identical decode again once the repeat-decode cooldown has elapsed", async () => {
+    // Proves the time-based dedup's other half: unlike the old permanent,
+    // identity-only dedup, the SAME decoded text must be allowed to fire
+    // onDecode again once enough real time has passed — this is what lets a
+    // consuming page (e.g. /sell) support scanning the same product's QR
+    // code twice in a row to add two units. The first decode and the second
+    // (post-cooldown) decode are delivered as two separate synchronous
+    // callback invocations from the mocked decodeFromVideoDevice, with
+    // vi.setSystemTime used to advance the clock past
+    // REPEAT_DECODE_COOLDOWN_MS (1500ms) in between — mirroring how
+    // tests/unit/sell.page.test.tsx mocks time for this same class of
+    // cooldown (vi.useFakeTimers({ toFake: ["Date"] }) + vi.setSystemTime,
+    // since the component reads Date.now() directly rather than scheduling
+    // a timer).
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      mockGetUserMedia(() =>
+        Promise.resolve({ getTracks: () => [] } as unknown as MediaStream)
+      );
+      const onDecode = vi.fn();
+      let callback!: (result: { getText: () => string } | undefined) => void;
+      decodeFromVideoDeviceMock.mockImplementation(
+        async (_deviceId: string, _video: unknown, cb: (result: { getText: () => string } | undefined) => void) => {
+          callback = cb;
+          callback({ getText: () => "abc123" });
+          return { stop: controlsStopMock };
+        }
+      );
+
+      render(<QrScanner onDecode={onDecode} />);
+
+      await waitFor(() => expect(onDecode).toHaveBeenCalledTimes(1));
+
+      // Advance past the 1500ms cooldown window via the faked Date clock.
+      vi.setSystemTime(Date.now() + 1600);
+
+      callback({ getText: () => "abc123" });
+
+      await waitFor(() => expect(onDecode).toHaveBeenCalledTimes(2));
+      expect(onDecode).toHaveBeenNthCalledWith(1, "abc123");
+      expect(onDecode).toHaveBeenNthCalledWith(2, "abc123");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

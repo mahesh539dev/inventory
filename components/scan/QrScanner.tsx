@@ -10,9 +10,24 @@ type QrScannerProps = {
   paused?: boolean;
 };
 
-export function QrScanner({ onDecode, paused = false }: QrScannerProps) {
+// How long an identical decode is suppressed after it fires, to absorb the
+// camera's own rapid internal re-scan (ZXing rescans roughly every ~500ms)
+// without treating it as a deliberate second scan. Must be clearly longer
+// than that internal interval so a single physical scan can never straddle
+// the boundary and double-fire, but short enough that a deliberate re-scan
+// of the same code a couple of seconds later isn't perceived as
+// unresponsive (e.g. the /sell page scanning the same product twice in a
+// row to add two units).
+const REPEAT_DECODE_COOLDOWN_MS = 1500;
+
+// `paused` is kept in the prop type for backward compatibility with
+// existing callers (e.g. app/(app)/scan/page.tsx) but is no longer
+// destructured/used here — it has no effect now that repeat-decode dedup
+// is time-based rather than paused-toggle-based (see
+// REPEAT_DECODE_COOLDOWN_MS above).
+export function QrScanner({ onDecode }: QrScannerProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const lastDecodedRef = useRef<string | null>(null);
+  const lastDecodeRef = useRef<{ text: string; decodedAt: number } | null>(null);
   const [state, setState] = useState<PermissionState>("requesting");
 
   useEffect(() => {
@@ -29,8 +44,11 @@ export function QrScanner({ onDecode, paused = false }: QrScannerProps) {
       .decodeFromVideoDevice(undefined, videoRef.current!, (result) => {
         if (cancelled || !result) return;
         const text = result.getText();
-        if (text === lastDecodedRef.current) return;
-        lastDecodedRef.current = text;
+        const last = lastDecodeRef.current;
+        if (last && last.text === text && Date.now() - last.decodedAt < REPEAT_DECODE_COOLDOWN_MS) {
+          return;
+        }
+        lastDecodeRef.current = { text, decodedAt: Date.now() };
         onDecode(text);
       })
       .then((scannerControls) => {
@@ -57,10 +75,6 @@ export function QrScanner({ onDecode, paused = false }: QrScannerProps) {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onDecode identity intentionally excluded; reader is set up once per mount
   }, []);
-
-  useEffect(() => {
-    if (!paused) lastDecodedRef.current = null;
-  }, [paused]);
 
   if (state === "denied") {
     return (

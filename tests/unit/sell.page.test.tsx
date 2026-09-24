@@ -21,12 +21,13 @@ vi.mock("@/components/scan/QrScanner", () => ({
   },
 }));
 // NOTE: capturedPausedValues is retained to assert QrScanner's `paused` prop
-// stays permanently false (see the dedicated test below) — this component no
-// longer toggles it. The real QrScanner's own repeat-decode dedup (its
-// `lastDecodedRef`, reset only when `paused` transitions true->false) is
-// intentionally never exercised by the page anymore; see
-// components/scan/QrScanner.tsx and task-8-report.md for why toggling it
-// caused a runaway add-loop.
+// stays permanently false. The real QrScanner now owns repeat-decode
+// dedup itself via a time-based cooldown (see components/scan/QrScanner.tsx
+// and tests/unit/QrScanner.test.tsx) — this mock intentionally has NO dedup
+// logic of its own, so every capturedOnDecode!() call here reaches
+// handleDecode directly, letting these page tests exercise handleDecode's
+// own logic (parsing, lookup, resolvingRef re-entrancy) in isolation from
+// QrScanner's internal timing.
 
 let capturedOnSelect: ((product: unknown) => void) | null = null;
 vi.mock("@/components/sell/ProductSearch", () => ({
@@ -107,76 +108,32 @@ describe("SellPage", () => {
     expect(capturedPausedValues.every((value) => value === false)).toBe(true);
   });
 
-  it("scanning the same product again after the cooldown window adds a second unit", async () => {
-    // Proves the cooldown-elapsed path: a deliberate re-scan of the same
-    // product's code (code physically moved away and re-presented, or
-    // enough time has simply passed) is treated as a new scan and adds
-    // another unit, calling lookupProductForSale again.
-    //
-    // Uses vi.useFakeTimers() with a real Date.now() shim disabled — instead
-    // we control time via vi.setSystemTime, since the page's cooldown check
-    // reads Date.now() directly (not setTimeout). RTL's waitFor() polls with
-    // real timers internally, which stalls when fake timers are active, so
-    // each awaited state change is driven explicitly through act() instead.
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      vi.mocked(lookupProductForSale).mockResolvedValue(productA);
-      render(<SellPage />);
+  it("scanning the same product twice adds two units", async () => {
+    // Proves the actual Phase 6 requirement end-to-end: scanning the same
+    // product's QR code twice in a row adds two units to the cart. This no
+    // longer needs fake timers or any cooldown simulation at the page
+    // level — QrScanner itself is now the single place that dedups a
+    // camera's rapid re-fire of the SAME physical scan (see
+    // components/scan/QrScanner.tsx and its own tests). The mocked
+    // QrScanner used here has no dedup logic, so firing capturedOnDecode!()
+    // twice models two decodes QrScanner has already decided are genuine
+    // (i.e. it already passed its own cooldown) — exactly what handleDecode
+    // must handle correctly: process every decode it's given.
+    vi.mocked(lookupProductForSale).mockResolvedValue(productA);
+    render(<SellPage />);
 
-      await act(async () => {
-        capturedOnDecode!("https://example.com/p/abc123");
-      });
-      expect(screen.getByText("Widget")).toBeInTheDocument();
-      expect(screen.getByText("1")).toBeInTheDocument();
+    await act(async () => {
+      capturedOnDecode!("https://example.com/p/abc123");
+    });
+    expect(screen.getByText("Widget")).toBeInTheDocument();
+    expect(screen.getByText("1")).toBeInTheDocument();
 
-      // Advance past the cooldown window (2000ms) via the faked Date clock.
-      vi.setSystemTime(Date.now() + 2100);
+    await act(async () => {
+      capturedOnDecode!("https://example.com/p/abc123");
+    });
 
-      await act(async () => {
-        capturedOnDecode!("https://example.com/p/abc123");
-      });
-
-      expect(screen.getByText("2")).toBeInTheDocument();
-      expect(lookupProductForSale).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("scanning the same product again immediately (within the cooldown window) is a no-op", async () => {
-    // Proves the within-cooldown path: this is the test that would have
-    // caught the runaway-add regression from the previous (reverted)
-    // paused-toggle fix. The camera's continuous decode loop re-firing
-    // onDecode for a code still in frame must NOT re-trigger a lookup or
-    // increment the cart line.
-    vi.useFakeTimers({ toFake: ["Date"] });
-    try {
-      vi.mocked(lookupProductForSale).mockResolvedValue(productA);
-      render(<SellPage />);
-
-      await act(async () => {
-        capturedOnDecode!("https://example.com/p/abc123");
-      });
-      expect(screen.getByText("Widget")).toBeInTheDocument();
-      expect(screen.getByText("1")).toBeInTheDocument();
-
-      // Simulate the camera re-firing onDecode for the same still-in-frame
-      // code a few times in quick succession, well within the cooldown.
-      vi.setSystemTime(Date.now() + 100);
-      await act(async () => {
-        capturedOnDecode!("https://example.com/p/abc123");
-      });
-      vi.setSystemTime(Date.now() + 100);
-      await act(async () => {
-        capturedOnDecode!("https://example.com/p/abc123");
-      });
-
-      expect(lookupProductForSale).toHaveBeenCalledTimes(1);
-      expect(screen.getByText("1")).toBeInTheDocument();
-      expect(screen.queryByText("2")).not.toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(screen.getByText("2")).toBeInTheDocument();
+    expect(lookupProductForSale).toHaveBeenCalledTimes(2);
   });
 
   it("adding a product via search also increments an existing line for the same product", async () => {
