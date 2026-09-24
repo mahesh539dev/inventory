@@ -172,4 +172,41 @@ describe("QrScanner", () => {
       vi.useRealTimers();
     }
   });
+
+  it("fires only once for a code held in frame across repeated ~500ms re-decodes", async () => {
+    // Complement of the test above: a code that never leaves the camera's
+    // view is re-decoded by ZXing roughly every ~500ms. Each of those
+    // re-decodes must refresh the cooldown (sliding window), so the held
+    // code never re-fires — even past the 1500ms mark measured from the
+    // first (only) accepted decode.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      mockGetUserMedia(() =>
+        Promise.resolve({ getTracks: () => [] } as unknown as MediaStream)
+      );
+      const onDecode = vi.fn();
+      let callback!: (result: { getText: () => string } | undefined) => void;
+      decodeFromVideoDeviceMock.mockImplementation(
+        async (_deviceId: string, _video: unknown, cb: (result: { getText: () => string } | undefined) => void) => {
+          callback = cb;
+          return { stop: controlsStopMock };
+        }
+      );
+
+      render(<QrScanner onDecode={onDecode} />);
+
+      await waitFor(() => expect(screen.getByTestId("qr-video")).toBeInTheDocument());
+
+      const start = Date.now();
+      for (const offset of [0, 500, 1000, 1500, 2000]) {
+        vi.setSystemTime(start + offset);
+        callback({ getText: () => "abc123" });
+      }
+
+      expect(onDecode).toHaveBeenCalledTimes(1);
+      expect(onDecode).toHaveBeenCalledWith("abc123");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

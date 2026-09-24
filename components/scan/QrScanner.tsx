@@ -10,14 +10,17 @@ type QrScannerProps = {
   paused?: boolean;
 };
 
-// How long an identical decode is suppressed after it fires, to absorb the
-// camera's own rapid internal re-scan (ZXing rescans roughly every ~500ms)
-// without treating it as a deliberate second scan. Must be clearly longer
-// than that internal interval so a single physical scan can never straddle
-// the boundary and double-fire, but short enough that a deliberate re-scan
-// of the same code a couple of seconds later isn't perceived as
-// unresponsive (e.g. the /sell page scanning the same product twice in a
-// row to add two units).
+// Sliding-window dedup for identical decodes. While a code stays in the
+// camera's view, ZXing re-decodes it roughly every ~500ms. Every sighting of
+// the same text — including ones that are suppressed — refreshes the
+// timestamp, so a held code never re-fires no matter how long it stays in
+// frame. The same text only counts as a new scan once it has been OUT of
+// frame (no decodes of it) for at least this long. Must be clearly longer
+// than ZXing's internal re-decode interval so consecutive in-frame sightings
+// always fall inside the window, but short enough that a deliberate re-scan
+// (move the code away, then show it again) isn't perceived as unresponsive
+// (e.g. the /sell page scanning the same product twice in a row to add two
+// units).
 const REPEAT_DECODE_COOLDOWN_MS = 1500;
 
 // `paused` is kept in the prop type for backward compatibility with
@@ -45,10 +48,12 @@ export function QrScanner({ onDecode }: QrScannerProps) {
         if (cancelled || !result) return;
         const text = result.getText();
         const last = lastDecodeRef.current;
-        if (last && last.text === text && Date.now() - last.decodedAt < REPEAT_DECODE_COOLDOWN_MS) {
+        const now = Date.now();
+        // Always record this sighting (sliding window), whether or not it fires.
+        lastDecodeRef.current = { text, decodedAt: now };
+        if (last && last.text === text && now - last.decodedAt < REPEAT_DECODE_COOLDOWN_MS) {
           return;
         }
-        lastDecodeRef.current = { text, decodedAt: Date.now() };
         onDecode(text);
       })
       .then((scannerControls) => {
