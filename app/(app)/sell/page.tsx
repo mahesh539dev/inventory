@@ -29,11 +29,6 @@ export default function SellPage() {
   const [buyerName, setBuyerName] = useState("");
   const [buyerPhone, setBuyerPhone] = useState("");
   const [isPending, startTransition] = useTransition();
-  // Briefly toggled true/false after a successful scan-add so the QrScanner's
-  // internal last-decoded-text memory (which only resets when its `paused`
-  // prop transitions back to false) is cleared, letting the same QR code be
-  // recognized again on an immediate repeat scan of the same product.
-  const [scannerPaused, setScannerPaused] = useState(false);
 
   // Synchronous re-entrancy guards. `isPending` from useTransition only
   // updates on React's next render, so it cannot reliably block a second
@@ -43,6 +38,25 @@ export default function SellPage() {
   // (success or failure), mirroring the reviewed fix in app/(app)/scan/page.tsx.
   const resolvingRef = useRef(false);
   const confirmingRef = useRef(false);
+
+  // Time-based cooldown guarding against the camera's continuous decode loop
+  // re-firing onDecode for the SAME still-in-frame QR code. QrScanner itself
+  // is never paused (its `paused` prop is always false here) — the camera
+  // keeps scanning frames continuously, and ZXing's own scan interval
+  // (~500ms) means a cashier holding a code steady for even a couple of
+  // seconds would trigger several decodes for the identical code. Rather
+  // than resetting QrScanner's internal dedup (which is a shared, one-shot,
+  // binary flag the camera loop can immediately re-trip — see task-8-report
+  // for why that produced a runaway add-loop), this tracks the last
+  // scan-added product's identifier and timestamp and ignores a repeat
+  // decode of the same identifier within SCAN_REPEAT_COOLDOWN_MS. Because
+  // the guard is a real elapsed-time comparison rather than a flag the
+  // camera can flip, it cannot fire repeatedly within its own window no
+  // matter how many times the camera's callback re-fires for the same code.
+  // A ref (not state) is used since this is a rapid-fire guard value that
+  // doesn't need to trigger re-renders.
+  const lastScanAddRef = useRef<{ identifier: string; addedAt: number } | null>(null);
+  const SCAN_REPEAT_COOLDOWN_MS = 2000;
 
   function addOrIncrement(product: ProductForSale) {
     setLines((current) => {
@@ -75,6 +89,19 @@ export default function SellPage() {
       return;
     }
 
+    const last = lastScanAddRef.current;
+    if (
+      last &&
+      last.identifier === parsed.publicIdentifier &&
+      Date.now() - last.addedAt < SCAN_REPEAT_COOLDOWN_MS
+    ) {
+      // Same code as the last scan-add, seen again within the cooldown
+      // window — this is the camera's continuous decode loop re-firing for
+      // a code that's still in frame, not a deliberate new scan. Silently
+      // ignore: no lookup, no error, no cart change.
+      return;
+    }
+
     resolvingRef.current = true;
     setAddError(null);
     try {
@@ -84,11 +111,7 @@ export default function SellPage() {
         return;
       }
       addOrIncrement(product);
-      // Reset the scanner's repeat-decode dedup so scanning this same QR
-      // code again immediately is recognized as a new add rather than
-      // silently ignored.
-      setScannerPaused(true);
-      setTimeout(() => setScannerPaused(false), 0);
+      lastScanAddRef.current = { identifier: parsed.publicIdentifier, addedAt: Date.now() };
     } finally {
       resolvingRef.current = false;
     }
@@ -192,7 +215,7 @@ export default function SellPage() {
     <div className="mx-auto max-w-sm space-y-6 p-6">
       <h1 className="text-xl font-semibold">Sell</h1>
 
-      {view === "cart" && <QrScanner onDecode={handleDecode} paused={scannerPaused} />}
+      {view === "cart" && <QrScanner onDecode={handleDecode} paused={false} />}
       <ProductSearch onSelect={handleSearchSelect} />
 
       {addError && (
