@@ -29,6 +29,11 @@ export default function SellPage() {
   const [buyerName, setBuyerName] = useState("");
   const [buyerPhone, setBuyerPhone] = useState("");
   const [isPending, startTransition] = useTransition();
+  // Briefly toggled true/false after a successful scan-add so the QrScanner's
+  // internal last-decoded-text memory (which only resets when its `paused`
+  // prop transitions back to false) is cleared, letting the same QR code be
+  // recognized again on an immediate repeat scan of the same product.
+  const [scannerPaused, setScannerPaused] = useState(false);
 
   // Synchronous re-entrancy guards. `isPending` from useTransition only
   // updates on React's next render, so it cannot reliably block a second
@@ -79,6 +84,11 @@ export default function SellPage() {
         return;
       }
       addOrIncrement(product);
+      // Reset the scanner's repeat-decode dedup so scanning this same QR
+      // code again immediately is recognized as a new add rather than
+      // silently ignored.
+      setScannerPaused(true);
+      setTimeout(() => setScannerPaused(false), 0);
     } finally {
       resolvingRef.current = false;
     }
@@ -133,9 +143,13 @@ export default function SellPage() {
           buyerPhone: buyerPhone.trim() || undefined,
         });
         router.push(`/sales/${result.saleId}`);
+        // Leave confirmingRef true on success: the page is navigating away
+        // regardless, and Next.js navigation isn't necessarily instantaneous,
+        // so clearing it here could re-enable "Confirm Sale" over the
+        // still-populated cart before the page unmounts.
       } catch (error) {
         setCheckoutError(error instanceof Error ? error.message : "Failed to complete sale");
-      } finally {
+        setView("cart");
         confirmingRef.current = false;
       }
     });
@@ -162,12 +176,6 @@ export default function SellPage() {
           <Input id="buyer-phone" value={buyerPhone} onChange={(e) => setBuyerPhone(e.target.value)} />
         </div>
 
-        {checkoutError && (
-          <p role="alert" className="text-sm text-destructive">
-            {checkoutError}
-          </p>
-        )}
-
         <div className="flex gap-2">
           <Button type="button" variant="outline" onClick={() => setView("cart")} disabled={isPending}>
             Back to cart
@@ -184,12 +192,18 @@ export default function SellPage() {
     <div className="mx-auto max-w-sm space-y-6 p-6">
       <h1 className="text-xl font-semibold">Sell</h1>
 
-      {view === "cart" && <QrScanner onDecode={handleDecode} paused={false} />}
+      {view === "cart" && <QrScanner onDecode={handleDecode} paused={scannerPaused} />}
       <ProductSearch onSelect={handleSearchSelect} />
 
       {addError && (
         <p role="alert" className="text-sm text-destructive">
           {addError}
+        </p>
+      )}
+
+      {checkoutError && (
+        <p role="alert" className="text-sm text-destructive">
+          {checkoutError}
         </p>
       )}
 
