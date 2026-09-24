@@ -177,8 +177,51 @@ describe("completeSale (integration)", () => {
     const [updatedA] = await db.select().from(products).where(eq(products.id, productA.id));
     expect(updatedA.currentQuantity).toBe(10);
 
-    const salesCount = await db.select().from(sales);
+    const salesCount = await db.select().from(sales).where(eq(sales.soldBy, userId));
     expect(salesCount).toHaveLength(0);
+  }, DB_TEST_TIMEOUT_MS);
+
+  it("rejects the WHOLE sale when two lines for the SAME product exceed combined stock, leaving currentQuantity unchanged", async () => {
+    const product = await makeProduct({ currentQuantity: 5 });
+
+    await expect(
+      completeSale({
+        items: [
+          { productId: product.id, quantity: 3, soldPricePerUnit: 5 },
+          { productId: product.id, quantity: 4, soldPricePerUnit: 5 }, // 3 + 4 = 7 > 5 available
+        ],
+        userId,
+      })
+    ).rejects.toBeInstanceOf(InsufficientInventoryError);
+
+    const [updated] = await db.select().from(products).where(eq(products.id, product.id));
+    expect(updated.currentQuantity).toBe(5);
+
+    const salesCount = await db.select().from(sales).where(eq(sales.soldBy, userId));
+    expect(salesCount).toHaveLength(0);
+  }, DB_TEST_TIMEOUT_MS);
+
+  it("completes a sale with two lines for the SAME product, decrementing by the combined total", async () => {
+    const product = await makeProduct({ currentQuantity: 10, costPrice: "4.00" });
+
+    const result = await completeSale({
+      items: [
+        { productId: product.id, quantity: 2, soldPricePerUnit: 12 },
+        { productId: product.id, quantity: 3, soldPricePerUnit: 15 },
+      ],
+      userId,
+    });
+
+    expect(result.items).toHaveLength(2);
+
+    const [updated] = await db.select().from(products).where(eq(products.id, product.id));
+    expect(updated.currentQuantity).toBe(5); // 10 - (2 + 3) = 5
+
+    const txns = await db
+      .select()
+      .from(inventoryTransactions)
+      .where(eq(inventoryTransactions.productId, product.id));
+    expect(txns).toHaveLength(2);
   }, DB_TEST_TIMEOUT_MS);
 
   it("throws ProductNotFoundError for an unknown productId", async () => {

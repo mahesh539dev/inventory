@@ -44,15 +44,32 @@ export async function completeSale(input: CompleteSaleInput): Promise<SaleWithIt
 
     const productById = new Map(lockedProducts.map((p) => [p.id, p]));
 
-    // Validate every line BEFORE writing anything — any single failure
-    // must roll back the whole transaction, not just skip that line.
+    // A cart can contain two or more lines for the SAME product (e.g. added
+    // separately, or with different soldPricePerUnit). Inventory math
+    // (stock validation and the currentQuantity decrement) must operate on
+    // the aggregated per-product total, not per line — otherwise two lines
+    // checked independently against the same pre-transaction snapshot can
+    // each individually "pass" a stock check while their sum oversells, and
+    // a second per-line update can clobber the first's write instead of
+    // compounding it. sale_items rows themselves stay one-per-line below,
+    // preserving each line's own soldPricePerUnit.
+    const aggregatedQuantityByProductId = new Map<string, number>();
     for (const item of input.items) {
-      const product = productById.get(item.productId);
+      aggregatedQuantityByProductId.set(
+        item.productId,
+        (aggregatedQuantityByProductId.get(item.productId) ?? 0) + item.quantity
+      );
+    }
+
+    // Validate every distinct product BEFORE writing anything — any single
+    // failure must roll back the whole transaction, not just skip that line.
+    for (const [productId, totalQuantity] of aggregatedQuantityByProductId) {
+      const product = productById.get(productId);
       if (!product) {
-        throw new ProductNotFoundError(item.productId);
+        throw new ProductNotFoundError(productId);
       }
-      if (product.currentQuantity < item.quantity) {
-        throw new InsufficientInventoryError(item.productId, item.quantity, product.currentQuantity);
+      if (product.currentQuantity < totalQuantity) {
+        throw new InsufficientInventoryError(productId, totalQuantity, product.currentQuantity);
       }
     }
 
@@ -89,11 +106,17 @@ export async function completeSale(input: CompleteSaleInput): Promise<SaleWithIt
         totalRevenue: money(lineRevenue),
         profit: money(lineProfit),
       });
+    }
 
+    // Apply the inventory decrement once per distinct product, using the
+    // aggregated total across all of that product's lines — not once per
+    // line off a shared pre-transaction snapshot (see aggregation above).
+    for (const [productId, totalQuantity] of aggregatedQuantityByProductId) {
+      const product = productById.get(productId)!;
       await tx
         .update(products)
-        .set({ currentQuantity: product.currentQuantity - item.quantity, updatedAt: new Date() })
-        .where(eq(products.id, item.productId));
+        .set({ currentQuantity: product.currentQuantity - totalQuantity, updatedAt: new Date() })
+        .where(eq(products.id, productId));
     }
 
     const { rows } = await tx.execute<{ nextval: string }>(sql`SELECT nextval('sale_number_seq')`);
