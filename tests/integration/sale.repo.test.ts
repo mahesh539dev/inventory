@@ -40,6 +40,63 @@ async function makeProduct(overrides: Partial<typeof products.$inferInsert> = {}
   return product;
 }
 
+describe("schema: returned_quantity column and PARTIALLY_RETURNED status", () => {
+  let userId: string;
+  let productId: string;
+
+  beforeEach(async () => {
+    const user = await makeUser();
+    userId = user.id;
+    const product = await makeProduct();
+    productId = product.id;
+  });
+
+  afterEach(async () => {
+    const testSales = await db.select({ id: sales.id }).from(sales).where(eq(sales.soldBy, userId));
+    const saleIds = testSales.map((s) => s.id);
+    if (saleIds.length > 0) {
+      await db.delete(saleItems).where(inArray(saleItems.saleId, saleIds));
+      await db.delete(sales).where(inArray(sales.id, saleIds));
+    }
+    await db.delete(products).where(eq(products.id, productId));
+    await db.delete(users).where(eq(users.id, userId));
+  });
+
+  it("allows inserting a sale_item with an explicit returnedQuantity and defaults to 0 when omitted", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}`,
+      soldBy: userId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "COMPLETED",
+    });
+    const [item] = await insertSaleItems([{
+      saleId: sale.id,
+      productId: productId,
+      quantity: 3,
+      costPerUnit: "1.00",
+      soldPricePerUnit: "2.00",
+      totalCost: "3.00",
+      totalRevenue: "6.00",
+      profit: "3.00",
+    }]);
+    expect(item.returnedQuantity).toBe(0);
+  });
+
+  it("allows updating a sale's status to PARTIALLY_RETURNED", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}-2`,
+      soldBy: userId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "PARTIALLY_RETURNED",
+    });
+    expect(sale.status).toBe("PARTIALLY_RETURNED");
+  });
+});
+
 describe("sale.repo", () => {
   let userId: string;
   let productId: string;

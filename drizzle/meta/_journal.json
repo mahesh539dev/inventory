@@ -15,6 +15,13 @@
       "when": 1790190869821,
       "tag": "0001_mysterious_nick_fury",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790326331998,
+      "tag": "0002_short_ikaris",
+      "breakpoints": true
     }
   ]
 }
