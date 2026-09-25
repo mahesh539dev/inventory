@@ -69,4 +69,20 @@ describe("product.repo", () => {
     const results = await listProducts({ status: "ARCHIVED", limit: 1000, offset: 0 });
     expect(results.find((p) => p.sku === `${TEST_SKU_PREFIX}001`)).toBeDefined();
   });
+
+  it("listProducts with no status filter returns both ACTIVE and ARCHIVED products", async () => {
+    const results = await listProducts({ limit: 1000, offset: 0 });
+    const statuses = new Set(results.map((p) => p.status));
+
+    expect(statuses.has("ACTIVE")).toBe(true);
+    expect(statuses.has("ARCHIVED")).toBe(true);
+  });
+
+  it("countProducts with no status filter counts both ACTIVE and ARCHIVED products", async () => {
+    const activeOnly = await countProducts({ status: "ACTIVE" });
+    const archivedOnly = await countProducts({ status: "ARCHIVED" });
+    const both = await countProducts({});
+
+    expect(both).toBe(activeOnly + archivedOnly);
+  });
 });

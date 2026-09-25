@@ -91,7 +91,7 @@ type ListParams = {
 };
 
 function buildFilters(params: Pick<ListParams, "search" | "categoryId" | "status">) {
-  const filters = [eq(products.status, params.status ?? "ACTIVE")];
+  const filters = params.status ? [eq(products.status, params.status)] : [];
 
   if (params.categoryId) {
     filters.push(eq(products.categoryId, params.categoryId));

@@ -1,6 +1,7 @@
 import {
   pgTable,
   pgEnum,
+  pgSequence,
   uuid,
   text,
   varchar,
@@ -86,6 +87,8 @@ export const inventoryTransactions = pgTable("inventory_transactions", {
   index("inventory_transactions_product_id_idx").on(table.productId),
 ]);
 
+export const saleNumberSeq = pgSequence("sale_number_seq", { startWith: 1 });
+
 export const sales = pgTable("sales", {
   id: uuid("id").primaryKey().defaultRandom(),
   saleNumber: varchar("sale_number", { length: 32 }).notNull(),
@@ -96,6 +99,8 @@ export const sales = pgTable("sales", {
   totalProfit: numeric("total_profit", { precision: 12, scale: 2 }).notNull(),
   status: saleStatusEnum("status").notNull().default("COMPLETED"),
   notes: text("notes"),
+  buyerName: text("buyer_name"),
+  buyerPhone: text("buyer_phone"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   uniqueIndex("sales_sale_number_idx").on(table.saleNumber),
