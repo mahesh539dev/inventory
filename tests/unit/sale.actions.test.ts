@@ -12,12 +12,32 @@ vi.mock("@/lib/repositories/product.repo", () => ({
 
 vi.mock("@/lib/services/sale.service", () => ({
   completeSale: vi.fn(),
-  InsufficientInventoryError: class InsufficientInventoryError extends Error {},
+  InsufficientInventoryError: class InsufficientInventoryError extends Error {
+    constructor(
+      public readonly productId: string,
+      public readonly requested: number,
+      public readonly available: number
+    ) {
+      super(`Insufficient inventory for product ${productId}: requested ${requested}, only ${available} available`);
+      this.name = "InsufficientInventoryError";
+    }
+  },
+}));
+
+vi.mock("@/lib/services/product.service", () => ({
+  ProductNotFoundError: class ProductNotFoundError extends Error {
+    constructor(public readonly productId: string) {
+      super(`Product not found: ${productId}`);
+      this.name = "ProductNotFoundError";
+    }
+  },
 }));
 
 import { requireUser } from "@/lib/auth/guards";
 import { findProductByPublicIdentifier, findProductBySku, listProducts } from "@/lib/repositories/product.repo";
 import { completeSale } from "@/lib/services/sale.service";
+import { InsufficientInventoryError } from "@/lib/services/sale.service";
+import { ProductNotFoundError } from "@/lib/services/product.service";
 import { lookupProductForSale, completeSaleAction } from "@/lib/actions/sale.actions";
 import { searchProductsForSale } from "@/lib/actions/product-search.actions";
 
@@ -110,16 +130,20 @@ describe("completeSaleAction", () => {
   it("validates input before calling completeSale, rejecting an empty cart", async () => {
     vi.mocked(requireUser).mockResolvedValue(sessionUser);
 
-    await expect(completeSaleAction({ items: [] })).rejects.toThrow();
+    const result = await completeSaleAction({ items: [] });
+
+    expect(result.ok).toBe(false);
     expect(completeSale).not.toHaveBeenCalled();
   });
 
   it("validates input before calling completeSale, rejecting a zero/negative sold price", async () => {
     vi.mocked(requireUser).mockResolvedValue(sessionUser);
 
-    await expect(
-      completeSaleAction({ items: [{ productId: "prod-1", quantity: 1, soldPricePerUnit: 0 }] })
-    ).rejects.toThrow();
+    const result = await completeSaleAction({
+      items: [{ productId: "prod-1", quantity: 1, soldPricePerUnit: 0 }],
+    });
+
+    expect(result.ok).toBe(false);
     expect(completeSale).not.toHaveBeenCalled();
   });
 
@@ -143,7 +167,53 @@ describe("completeSaleAction", () => {
       buyerPhone: undefined,
       userId: "user-1",
     });
-    expect(result).toEqual({ saleId: "sale-1", saleNumber: "SALE-000001" });
+    expect(result).toEqual({ ok: true, saleId: "sale-1", saleNumber: "SALE-000001" });
+  });
+
+  it("returns an ok:false result with structured data when completeSale throws InsufficientInventoryError", async () => {
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+    const productId = "11111111-1111-4111-8111-111111111111";
+    vi.mocked(completeSale).mockRejectedValue(
+      new InsufficientInventoryError(productId, 5, 2)
+    );
+
+    const result = await completeSaleAction({
+      items: [{ productId, quantity: 5, soldPricePerUnit: 10 }],
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: `Insufficient inventory for product ${productId}: requested 5, only 2 available`,
+      productId,
+      available: 2,
+    });
+  });
+
+  it("returns an ok:false result with the productId when completeSale throws ProductNotFoundError", async () => {
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+    const productId = "11111111-1111-4111-8111-111111111111";
+    vi.mocked(completeSale).mockRejectedValue(new ProductNotFoundError(productId));
+
+    const result = await completeSaleAction({
+      items: [{ productId, quantity: 1, soldPricePerUnit: 10 }],
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      error: `Product not found: ${productId}`,
+      productId,
+    });
+  });
+
+  it("re-throws genuinely unexpected errors from completeSale", async () => {
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+    vi.mocked(completeSale).mockRejectedValue(new Error("DB connection lost"));
+
+    await expect(
+      completeSaleAction({
+        items: [{ productId: "11111111-1111-4111-8111-111111111111", quantity: 1, soldPricePerUnit: 10 }],
+      })
+    ).rejects.toThrow("DB connection lost");
   });
 });
 

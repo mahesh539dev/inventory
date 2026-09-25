@@ -6,7 +6,11 @@ import { insertInventoryTransaction } from "@/lib/repositories/inventory.repo";
 import { ProductNotFoundError } from "@/lib/services/product.service";
 
 export class InsufficientInventoryError extends Error {
-  constructor(productId: string, requested: number, available: number) {
+  constructor(
+    public readonly productId: string,
+    public readonly requested: number,
+    public readonly available: number
+  ) {
     super(
       `Insufficient inventory for product ${productId}: requested ${requested}, only ${available} available`
     );

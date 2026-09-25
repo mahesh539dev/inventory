@@ -132,6 +132,29 @@ export default function SellPage() {
           buyerName: buyerName.trim() || undefined,
           buyerPhone: buyerPhone.trim() || undefined,
         });
+
+        if (!result.ok) {
+          const failingLine = result.productId
+            ? lines.find((line) => line.productId === result.productId)
+            : undefined;
+          setCheckoutError(
+            failingLine ? `${result.error} (${failingLine.productName})` : result.error
+          );
+          if (failingLine && typeof result.available === "number") {
+            const knownAvailable = result.available;
+            setLines((current) =>
+              current.map((line) =>
+                line.productId === failingLine.productId
+                  ? { ...line, knownStock: knownAvailable }
+                  : line
+              )
+            );
+          }
+          setView("cart");
+          confirmingRef.current = false;
+          return;
+        }
+
         router.push(`/sales/${result.saleId}`);
         // Leave confirmingRef true on success: the page is navigating away
         // regardless, and Next.js navigation isn't necessarily instantaneous,
@@ -145,6 +168,14 @@ export default function SellPage() {
     });
   }
 
+  const hasInvalidLine = lines.some(
+    (line) =>
+      !Number.isFinite(line.soldPricePerUnit) ||
+      line.soldPricePerUnit <= 0 ||
+      !Number.isInteger(line.quantity) ||
+      line.quantity < 1
+  );
+
   if (view === "checkout") {
     return (
       <div className="mx-auto max-w-sm space-y-6 p-6">
@@ -156,6 +187,12 @@ export default function SellPage() {
           onPriceChange={handlePriceChange}
           onRemove={handleRemove}
         />
+
+        {hasInvalidLine && (
+          <p className="text-sm text-destructive">
+            Fix the highlighted price/quantity before confirming.
+          </p>
+        )}
 
         <div className="space-y-2">
           <Label htmlFor="buyer-name">Buyer name (optional)</Label>
@@ -170,7 +207,11 @@ export default function SellPage() {
           <Button type="button" variant="outline" onClick={() => setView("cart")} disabled={isPending}>
             Back to cart
           </Button>
-          <Button type="button" onClick={handleConfirm} disabled={isPending}>
+          <Button
+            type="button"
+            onClick={handleConfirm}
+            disabled={isPending || lines.length === 0 || hasInvalidLine}
+          >
             Confirm Sale
           </Button>
         </div>

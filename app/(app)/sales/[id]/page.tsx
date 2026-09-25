@@ -62,9 +62,13 @@ export default async function SaleDetailPage({
             {sale.items.map((item) => (
               <TableRow key={item.id}>
                 <TableCell>
-                  <Link href={`/products/${item.productId}`} className="underline">
-                    View product
+                  <Link
+                    href={`/products/${item.productId}`}
+                    className="font-medium underline-offset-4 hover:underline"
+                  >
+                    {item.productName}
                   </Link>
+                  <p className="text-xs text-muted-foreground">{item.sku}</p>
                 </TableCell>
                 <TableCell>{item.quantity}</TableCell>
                 <TableCell>${item.soldPricePerUnit}</TableCell>

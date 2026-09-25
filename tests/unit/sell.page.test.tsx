@@ -168,7 +168,11 @@ describe("SellPage", () => {
 
   it("confirming a sale calls completeSaleAction and navigates to the sale detail page", async () => {
     vi.mocked(lookupProductForSale).mockResolvedValue(productA);
-    vi.mocked(completeSaleAction).mockResolvedValue({ saleId: "sale-1", saleNumber: "SALE-000001" });
+    vi.mocked(completeSaleAction).mockResolvedValue({
+      ok: true,
+      saleId: "sale-1",
+      saleNumber: "SALE-000001",
+    });
     render(<SellPage />);
 
     capturedOnDecode!("https://example.com/p/abc123");
@@ -186,9 +190,14 @@ describe("SellPage", () => {
     });
   });
 
-  it("returns to the cart-building view with cart intact when checkout fails", async () => {
+  it("returns to the cart-building view with cart intact when checkout fails with an expected domain error", async () => {
     vi.mocked(lookupProductForSale).mockResolvedValue(productA);
-    vi.mocked(completeSaleAction).mockRejectedValue(new Error("Insufficient inventory for product prod-1"));
+    vi.mocked(completeSaleAction).mockResolvedValue({
+      ok: false,
+      error: "Insufficient inventory for product prod-1: requested 1, only 0 available",
+      productId: "prod-1",
+      available: 0,
+    });
     render(<SellPage />);
 
     capturedOnDecode!("https://example.com/p/abc123");
@@ -198,6 +207,9 @@ describe("SellPage", () => {
     fireEvent.click(screen.getByRole("button", { name: /confirm sale/i }));
 
     await waitFor(() => expect(screen.getByText(/insufficient inventory/i)).toBeInTheDocument());
+    // Includes the failing line's product name so the user can tell which
+    // line failed without seeing a raw UUID.
+    expect(screen.getByText(/\(Widget\)/)).toBeInTheDocument();
     expect(pushMock).not.toHaveBeenCalled();
     expect(screen.getByText("Widget")).toBeInTheDocument(); // cart line still present
     // Actually returned to the cart-building view, not just showing the
@@ -206,9 +218,28 @@ describe("SellPage", () => {
     expect(screen.getByRole("button", { name: /^checkout$/i })).toBeInTheDocument();
   });
 
+  it("returns to the cart-building view when checkout fails with a genuinely unexpected thrown error", async () => {
+    // Proves the catch-block fallback still works for real thrown/rejected
+    // errors (e.g. a network failure) distinct from the {ok:false} contract.
+    vi.mocked(lookupProductForSale).mockResolvedValue(productA);
+    vi.mocked(completeSaleAction).mockRejectedValue(new Error("Network error"));
+    render(<SellPage />);
+
+    capturedOnDecode!("https://example.com/p/abc123");
+    await waitFor(() => expect(screen.getByText("Widget")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /checkout/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /confirm sale/i })).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /confirm sale/i }));
+
+    await waitFor(() => expect(screen.getByText("Network error")).toBeInTheDocument());
+    expect(pushMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Widget")).toBeInTheDocument();
+    expect(screen.getByTestId("qr-scanner-stub")).toBeInTheDocument();
+  });
+
   it("ignores a second checkout confirm fired while the first is still resolving", async () => {
     vi.mocked(lookupProductForSale).mockResolvedValue(productA);
-    let resolveFirst!: (value: { saleId: string; saleNumber: string }) => void;
+    let resolveFirst!: (value: { ok: true; saleId: string; saleNumber: string }) => void;
     vi.mocked(completeSaleAction).mockImplementation(
       () => new Promise((resolve) => { resolveFirst = resolve; })
     );
@@ -233,7 +264,30 @@ describe("SellPage", () => {
 
     expect(completeSaleAction).toHaveBeenCalledTimes(1);
 
-    resolveFirst({ saleId: "sale-1", saleNumber: "SALE-000001" });
+    resolveFirst({ ok: true, saleId: "sale-1", saleNumber: "SALE-000001" });
     await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("disables Confirm Sale when a line has an invalid price, and re-enables it once fixed", async () => {
+    vi.mocked(lookupProductForSale).mockResolvedValue(productA);
+    render(<SellPage />);
+
+    capturedOnDecode!("https://example.com/p/abc123");
+    await waitFor(() => expect(screen.getByText("Widget")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: /checkout/i }));
+    await waitFor(() => expect(screen.getByRole("button", { name: /confirm sale/i })).toBeInTheDocument());
+
+    const confirmButton = screen.getByRole("button", { name: /confirm sale/i });
+    expect(confirmButton).not.toBeDisabled();
+
+    const priceInput = screen.getByLabelText("Sold price");
+    fireEvent.change(priceInput, { target: { value: "" } });
+
+    await waitFor(() => expect(confirmButton).toBeDisabled());
+    expect(screen.getByText(/fix the highlighted price\/quantity/i)).toBeInTheDocument();
+
+    fireEvent.change(priceInput, { target: { value: "12.50" } });
+
+    await waitFor(() => expect(confirmButton).not.toBeDisabled());
   });
 });

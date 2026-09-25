@@ -148,6 +148,71 @@ describe("sale.repo", () => {
     expect(found).toBeUndefined();
   });
 
+  it("findSaleById attaches each item's productName/sku, and orders items deterministically", async () => {
+    const product2 = await makeProduct({
+      sku: `SKU-${crypto.randomUUID().slice(0, 8)}`,
+      productName: "Second Product",
+    });
+
+    const sale = await insertSale({
+      saleNumber: "SALE-000006",
+      soldBy: userId,
+      totalAmount: "40.00",
+      totalCost: "20.00",
+      totalProfit: "20.00",
+      status: "COMPLETED",
+    });
+
+    const insertedItems = await insertSaleItems([
+      {
+        saleId: sale.id,
+        productId,
+        quantity: 2,
+        costPerUnit: "5.00",
+        soldPricePerUnit: "10.00",
+        totalCost: "10.00",
+        totalRevenue: "20.00",
+        profit: "10.00",
+      },
+      {
+        saleId: sale.id,
+        productId: product2.id,
+        quantity: 1,
+        costPerUnit: "10.00",
+        soldPricePerUnit: "20.00",
+        totalCost: "10.00",
+        totalRevenue: "20.00",
+        profit: "10.00",
+      },
+    ]);
+
+    try {
+      const found = await findSaleById(sale.id);
+
+      expect(found).toBeDefined();
+      expect(found!.items).toHaveLength(2);
+
+      // Deterministic order: by saleItems.id ascending, matching insertion order.
+      expect(found!.items.map((item) => item.id)).toEqual(insertedItems.map((item) => item.id));
+
+      const firstItem = found!.items.find((item) => item.productId === productId);
+      const secondItem = found!.items.find((item) => item.productId === product2.id);
+
+      expect(firstItem?.productName).toBe("Test Product");
+      expect(firstItem?.sku).toBe((await db.select().from(products).where(eq(products.id, productId)))[0].sku);
+      expect(secondItem?.productName).toBe("Second Product");
+      expect(secondItem?.sku).toBe(product2.sku);
+    } finally {
+      // Delete this test's own sale_items/sale before product2, since
+      // product2 is a second product outside the outer afterEach's cleanup
+      // scope (which only knows about the shared `productId`) and the FK
+      // from sale_items to products would otherwise block the delete.
+      await db.delete(saleItems).where(eq(saleItems.saleId, sale.id));
+      await db.delete(sales).where(eq(sales.id, sale.id));
+      await db.delete(products).where(eq(products.id, product2.id));
+    }
+  });
+
   it("listSales returns sales newest-first, respecting limit/offset", async () => {
     await insertSale({
       saleNumber: "SALE-000003",

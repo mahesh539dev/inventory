@@ -2,7 +2,8 @@
 
 import { requireUser } from "@/lib/auth/guards";
 import { findProductByPublicIdentifier, findProductBySku } from "@/lib/repositories/product.repo";
-import { completeSale as completeSaleService } from "@/lib/services/sale.service";
+import { completeSale as completeSaleService, InsufficientInventoryError } from "@/lib/services/sale.service";
+import { ProductNotFoundError } from "@/lib/services/product.service";
 import { completeSaleSchema } from "@/lib/validation/sale.schema";
 
 export type ProductForSale = {
@@ -40,21 +41,42 @@ export async function lookupProductForSale(input: {
   };
 }
 
+export type CompleteSaleResult =
+  | { ok: true; saleId: string; saleNumber: string }
+  | { ok: false; error: string; productId?: string; available?: number };
+
 export async function completeSaleAction(input: {
   items: { productId: string; quantity: number; soldPricePerUnit: number }[];
   buyerName?: string;
   buyerPhone?: string;
-}): Promise<{ saleId: string; saleNumber: string }> {
+}): Promise<CompleteSaleResult> {
   const user = await requireUser();
 
-  const parsed = completeSaleSchema.parse(input);
+  const parsed = completeSaleSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid sale data" };
+  }
 
-  const sale = await completeSaleService({
-    items: parsed.items,
-    buyerName: parsed.buyerName,
-    buyerPhone: parsed.buyerPhone,
-    userId: user.id,
-  });
-
-  return { saleId: sale.id, saleNumber: sale.saleNumber };
+  try {
+    const sale = await completeSaleService({
+      items: parsed.data.items,
+      buyerName: parsed.data.buyerName,
+      buyerPhone: parsed.data.buyerPhone,
+      userId: user.id,
+    });
+    return { ok: true, saleId: sale.id, saleNumber: sale.saleNumber };
+  } catch (error) {
+    if (error instanceof InsufficientInventoryError) {
+      return {
+        ok: false,
+        error: error.message,
+        productId: error.productId,
+        available: error.available,
+      };
+    }
+    if (error instanceof ProductNotFoundError) {
+      return { ok: false, error: error.message, productId: error.productId };
+    }
+    throw error;
+  }
 }

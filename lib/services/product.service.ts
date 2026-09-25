@@ -19,8 +19,8 @@ export class DuplicateSkuError extends Error {
 }
 
 export class ProductNotFoundError extends Error {
-  constructor(id: string) {
-    super(`Product not found: ${id}`);
+  constructor(public readonly productId: string) {
+    super(`Product not found: ${productId}`);
     this.name = "ProductNotFoundError";
   }
 }
