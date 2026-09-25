@@ -1,6 +1,6 @@
 import { db } from "@/lib/db/client";
 import { sales, saleItems, products } from "@/lib/db/schema";
-import { eq, desc, count, asc, inArray } from "drizzle-orm";
+import { eq, desc, count, asc, inArray, and, gte, lte, or, ilike, type SQL } from "drizzle-orm";
 import type { DbOrTx } from "./inventory.repo";
 
 export type SaleRow = typeof sales.$inferSelect;
@@ -20,17 +20,97 @@ export async function insertSaleItems(
   return executor.insert(saleItems).values(data).returning();
 }
 
-export async function listSales(params: { limit: number; offset: number }): Promise<SaleRow[]> {
+export async function findSaleForUpdate(id: string, tx: DbOrTx): Promise<SaleRow | undefined> {
+  const [row] = await tx.select().from(sales).where(eq(sales.id, id)).for("update");
+  return row;
+}
+
+export async function findSaleItemsForUpdate(saleId: string, tx: DbOrTx): Promise<SaleItemRow[]> {
+  return tx
+    .select()
+    .from(saleItems)
+    .where(eq(saleItems.saleId, saleId))
+    .orderBy(asc(saleItems.id))
+    .for("update");
+}
+
+export async function updateSaleItemReturnedQuantity(
+  saleItemId: string,
+  newReturnedQuantity: number,
+  tx: DbOrTx
+): Promise<void> {
+  await tx
+    .update(saleItems)
+    .set({ returnedQuantity: newReturnedQuantity })
+    .where(eq(saleItems.id, saleItemId));
+}
+
+export async function updateSaleStatus(
+  saleId: string,
+  status: SaleRow["status"],
+  tx: DbOrTx
+): Promise<void> {
+  await tx.update(sales).set({ status }).where(eq(sales.id, saleId));
+}
+
+export type ListSalesParams = {
+  limit: number;
+  offset: number;
+  query?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
+  productId?: string;
+  userId?: string;
+  status?: SaleRow["status"];
+};
+
+function buildSalesFilters(params: Omit<ListSalesParams, "limit" | "offset">): SQL | undefined {
+  const filters: SQL[] = [];
+
+  if (params.status) filters.push(eq(sales.status, params.status));
+  if (params.userId) filters.push(eq(sales.soldBy, params.userId));
+  if (params.dateFrom) filters.push(gte(sales.soldAt, params.dateFrom));
+  if (params.dateTo) filters.push(lte(sales.soldAt, params.dateTo));
+
+  if (params.query && params.query.trim().length > 0) {
+    const term = `%${params.query.trim()}%`;
+    const queryFilter = or(
+      ilike(sales.saleNumber, term),
+      inArray(
+        sales.id,
+        db.select({ id: saleItems.saleId }).from(saleItems).innerJoin(products, eq(saleItems.productId, products.id)).where(ilike(products.sku, term))
+      )
+    );
+    if (queryFilter) filters.push(queryFilter);
+  }
+
+  if (params.productId) {
+    filters.push(
+      inArray(
+        sales.id,
+        db.select({ id: saleItems.saleId }).from(saleItems).where(eq(saleItems.productId, params.productId))
+      )
+    );
+  }
+
+  return filters.length > 0 ? and(...filters) : undefined;
+}
+
+export async function listSales(params: ListSalesParams): Promise<SaleRow[]> {
   return db
     .select()
     .from(sales)
+    .where(buildSalesFilters(params))
     .orderBy(desc(sales.soldAt))
     .limit(params.limit)
     .offset(params.offset);
 }
 
-export async function countSales(): Promise<number> {
-  const [{ value }] = await db.select({ value: count() }).from(sales);
+export async function countSales(params: Omit<ListSalesParams, "limit" | "offset"> = {}): Promise<number> {
+  const [{ value }] = await db
+    .select({ value: count() })
+    .from(sales)
+    .where(buildSalesFilters(params));
   return value;
 }
 

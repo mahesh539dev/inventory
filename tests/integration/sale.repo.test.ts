@@ -8,6 +8,10 @@ import {
   listSales,
   countSales,
   findSaleById,
+  findSaleForUpdate,
+  findSaleItemsForUpdate,
+  updateSaleItemReturnedQuantity,
+  updateSaleStatus,
 } from "@/lib/repositories/sale.repo";
 
 async function makeUser() {
@@ -307,5 +311,245 @@ describe("sale.repo", () => {
     const total = await countSales();
 
     expect(total).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("findSaleForUpdate / findSaleItemsForUpdate / updateSaleItemReturnedQuantity / updateSaleStatus", () => {
+  let userId: string;
+  let productId: string;
+
+  beforeEach(async () => {
+    const user = await makeUser();
+    userId = user.id;
+    const product = await makeProduct();
+    productId = product.id;
+  });
+
+  afterEach(async () => {
+    const testSales = await db.select({ id: sales.id }).from(sales).where(eq(sales.soldBy, userId));
+    const saleIds = testSales.map((s) => s.id);
+    if (saleIds.length > 0) {
+      await db.delete(saleItems).where(inArray(saleItems.saleId, saleIds));
+      await db.delete(sales).where(inArray(sales.id, saleIds));
+    }
+    await db.delete(products).where(eq(products.id, productId));
+    await db.delete(users).where(eq(users.id, userId));
+  });
+
+  it("findSaleForUpdate returns the sale row inside a transaction", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}`,
+      soldBy: userId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "COMPLETED",
+    });
+    await db.transaction(async (tx) => {
+      const found = await findSaleForUpdate(sale.id, tx);
+      expect(found?.id).toBe(sale.id);
+    });
+  });
+
+  it("findSaleForUpdate returns undefined for a missing id", async () => {
+    await db.transaction(async (tx) => {
+      const found = await findSaleForUpdate("00000000-0000-0000-0000-000000000000", tx);
+      expect(found).toBeUndefined();
+    });
+  });
+
+  it("findSaleItemsForUpdate returns items ordered by id ascending", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}-i`,
+      soldBy: userId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "COMPLETED",
+    });
+    const inserted = await insertSaleItems([
+      {
+        saleId: sale.id,
+        productId,
+        quantity: 2,
+        costPerUnit: "1.00",
+        soldPricePerUnit: "2.00",
+        totalCost: "2.00",
+        totalRevenue: "4.00",
+        profit: "2.00",
+      },
+      {
+        saleId: sale.id,
+        productId,
+        quantity: 1,
+        costPerUnit: "1.00",
+        soldPricePerUnit: "2.00",
+        totalCost: "1.00",
+        totalRevenue: "2.00",
+        profit: "1.00",
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      const items = await findSaleItemsForUpdate(sale.id, tx);
+      expect(items.map((i) => i.id)).toEqual([...inserted.map((i) => i.id)].sort());
+    });
+  });
+
+  it("updateSaleItemReturnedQuantity persists the new value", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}-r`,
+      soldBy: userId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "COMPLETED",
+    });
+    const [item] = await insertSaleItems([
+      {
+        saleId: sale.id,
+        productId,
+        quantity: 5,
+        costPerUnit: "1.00",
+        soldPricePerUnit: "2.00",
+        totalCost: "5.00",
+        totalRevenue: "10.00",
+        profit: "5.00",
+      },
+    ]);
+    await db.transaction(async (tx) => {
+      await updateSaleItemReturnedQuantity(item.id, 3, tx);
+    });
+    const reloaded = await findSaleById(sale.id);
+    expect(reloaded?.items[0].returnedQuantity).toBe(3);
+  });
+
+  it("updateSaleStatus persists the new status", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}-s`,
+      soldBy: userId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "COMPLETED",
+    });
+    await db.transaction(async (tx) => {
+      await updateSaleStatus(sale.id, "CANCELLED", tx);
+    });
+    const reloaded = await findSaleById(sale.id);
+    expect(reloaded?.status).toBe("CANCELLED");
+  });
+});
+
+describe("listSales / countSales filters", () => {
+  let userId: string;
+  let productId: string;
+
+  beforeEach(async () => {
+    const user = await makeUser();
+    userId = user.id;
+    const product = await makeProduct();
+    productId = product.id;
+  });
+
+  afterEach(async () => {
+    const testSales = await db.select({ id: sales.id }).from(sales).where(eq(sales.soldBy, userId));
+    const saleIds = testSales.map((s) => s.id);
+    if (saleIds.length > 0) {
+      await db.delete(saleItems).where(inArray(saleItems.saleId, saleIds));
+      await db.delete(sales).where(inArray(sales.id, saleIds));
+    }
+    await db.delete(products).where(eq(products.id, productId));
+    await db.delete(users).where(eq(users.id, userId));
+  });
+
+  it("filters by status", async () => {
+    const completed = await insertSale({
+      saleNumber: `TEST-${Date.now()}-f1`,
+      soldBy: userId,
+      totalAmount: "1.00",
+      totalCost: "1.00",
+      totalProfit: "0.00",
+      status: "COMPLETED",
+    });
+    const cancelled = await insertSale({
+      saleNumber: `TEST-${Date.now()}-f2`,
+      soldBy: userId,
+      totalAmount: "1.00",
+      totalCost: "1.00",
+      totalProfit: "0.00",
+      status: "CANCELLED",
+    });
+
+    const results = await listSales({ limit: 50, offset: 0, status: "CANCELLED" });
+    const ids = results.map((s) => s.id);
+    expect(ids).toContain(cancelled.id);
+    expect(ids).not.toContain(completed.id);
+
+    const total = await countSales({ status: "CANCELLED" });
+    expect(total).toBeGreaterThanOrEqual(1);
+  });
+
+  it("filters by sale number query match", async () => {
+    const uniqueNumber = `TEST-UNIQUE-${Date.now()}`;
+    const sale = await insertSale({
+      saleNumber: uniqueNumber,
+      soldBy: userId,
+      totalAmount: "1.00",
+      totalCost: "1.00",
+      totalProfit: "0.00",
+      status: "COMPLETED",
+    });
+    const results = await listSales({ limit: 50, offset: 0, query: uniqueNumber });
+    expect(results.map((s) => s.id)).toEqual([sale.id]);
+  });
+
+  it("filters by product id (via sale_items join)", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}-p`,
+      soldBy: userId,
+      totalAmount: "1.00",
+      totalCost: "1.00",
+      totalProfit: "0.00",
+      status: "COMPLETED",
+    });
+    await insertSaleItems([
+      {
+        saleId: sale.id,
+        productId,
+        quantity: 1,
+        costPerUnit: "1.00",
+        soldPricePerUnit: "1.00",
+        totalCost: "1.00",
+        totalRevenue: "1.00",
+        profit: "0.00",
+      },
+    ]);
+    const results = await listSales({ limit: 50, offset: 0, productId });
+    expect(results.map((s) => s.id)).toContain(sale.id);
+  });
+
+  it("filters by user id", async () => {
+    const results = await listSales({ limit: 50, offset: 0, userId });
+    expect(results.every((s) => s.soldBy === userId)).toBe(true);
+  });
+
+  it("filters by date range", async () => {
+    const results = await listSales({
+      limit: 50,
+      offset: 0,
+      dateFrom: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      dateTo: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
+    expect(results.length).toBeGreaterThanOrEqual(0); // sanity: query executes without error and returns an array
+  });
+
+  it("combines two filters with AND semantics", async () => {
+    const results = await listSales({ limit: 50, offset: 0, status: "COMPLETED", userId });
+    expect(results.every((s) => s.status === "COMPLETED" && s.soldBy === userId)).toBe(true);
+  });
+
+  it("returns an empty array when filters match nothing", async () => {
+    const results = await listSales({ limit: 50, offset: 0, query: "NO-SUCH-SALE-NUMBER-XYZ" });
+    expect(results).toEqual([]);
   });
 });

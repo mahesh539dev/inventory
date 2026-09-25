@@ -14,3 +14,7 @@ export async function findUserNamesByIds(ids: string[]): Promise<Map<string, str
 
   return new Map(rows.map((u) => [u.id, u.name]));
 }
+
+export async function listUsersForFilter(): Promise<{ id: string; name: string }[]> {
+  return db.select({ id: users.id, name: users.name }).from(users).orderBy(users.name);
+}
