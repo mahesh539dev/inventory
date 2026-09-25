@@ -4,6 +4,8 @@ import { requireUser } from "@/lib/auth/guards";
 import { findSaleById } from "@/lib/repositories/sale.repo";
 import { findUserNamesByIds } from "@/lib/repositories/user.repo";
 import { Badge } from "@/components/ui/badge";
+import { CancelSaleButton } from "@/components/sales/CancelSaleButton";
+import { ReturnItemsDialog } from "@/components/sales/ReturnItemsDialog";
 import {
   Table,
   TableBody,
@@ -26,16 +28,40 @@ export default async function SaleDetailPage({
 
   const userNameById = await findUserNamesByIds([sale.soldBy]);
 
+  const returnedAmount = sale.items.reduce(
+    (sum, item) => sum + item.returnedQuantity * Number(item.soldPricePerUnit),
+    0
+  );
+  const hasAnyReturn = sale.items.some((item) => item.returnedQuantity > 0);
+  const netAmount = Number(sale.totalAmount) - returnedAmount;
+
   return (
     <div className="p-4 space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold">{sale.saleNumber}</h1>
-        <p className="text-muted-foreground">
-          {sale.soldAt.toLocaleString()} · Sold by {userNameById.get(sale.soldBy) ?? "Unknown"}
-        </p>
-        <Badge variant="secondary" className="mt-2">
-          {sale.status}
-        </Badge>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold">{sale.saleNumber}</h1>
+          <p className="text-muted-foreground">
+            {sale.soldAt.toLocaleString()} · Sold by {userNameById.get(sale.soldBy) ?? "Unknown"}
+          </p>
+          <Badge variant="secondary" className="mt-2">
+            {sale.status}
+          </Badge>
+        </div>
+        <div className="flex gap-2">
+          {sale.status === "COMPLETED" && <CancelSaleButton saleId={sale.id} />}
+          {(sale.status === "COMPLETED" || sale.status === "PARTIALLY_RETURNED") && (
+            <ReturnItemsDialog
+              saleId={sale.id}
+              items={sale.items.map((item) => ({
+                id: item.id,
+                productName: item.productName,
+                sku: item.sku,
+                quantity: item.quantity,
+                returnedQuantity: item.returnedQuantity,
+              }))}
+            />
+          )}
+        </div>
       </div>
 
       {(sale.buyerName || sale.buyerPhone) && (
@@ -52,6 +78,7 @@ export default async function SaleDetailPage({
             <TableRow>
               <TableHead>Product</TableHead>
               <TableHead>Qty</TableHead>
+              <TableHead>Returned</TableHead>
               <TableHead>Sold Price</TableHead>
               <TableHead>Cost</TableHead>
               <TableHead>Revenue</TableHead>
@@ -71,6 +98,7 @@ export default async function SaleDetailPage({
                   <p className="text-xs text-muted-foreground">{item.sku}</p>
                 </TableCell>
                 <TableCell>{item.quantity}</TableCell>
+                <TableCell>{item.returnedQuantity > 0 ? item.returnedQuantity : "—"}</TableCell>
                 <TableCell>${item.soldPricePerUnit}</TableCell>
                 <TableCell>${item.costPerUnit}</TableCell>
                 <TableCell>${item.totalRevenue}</TableCell>
@@ -81,10 +109,18 @@ export default async function SaleDetailPage({
         </Table>
       </div>
 
-      <div className="flex justify-end gap-6 text-sm font-medium">
-        <span>Total cost: ${sale.totalCost}</span>
-        <span>Total revenue: ${sale.totalAmount}</span>
-        <span>Total profit: ${sale.totalProfit}</span>
+      <div className="flex flex-col items-end gap-1 text-sm">
+        <div className="flex gap-6 font-medium">
+          <span>Total cost: ${sale.totalCost}</span>
+          <span>Total revenue: ${sale.totalAmount}</span>
+          <span>Total profit: ${sale.totalProfit}</span>
+        </div>
+        {hasAnyReturn && (
+          <div className="flex gap-6 text-muted-foreground">
+            <span>Returned: -${returnedAmount.toFixed(2)}</span>
+            <span className="font-medium text-foreground">Net: ${netAmount.toFixed(2)}</span>
+          </div>
+        )}
       </div>
     </div>
   );
