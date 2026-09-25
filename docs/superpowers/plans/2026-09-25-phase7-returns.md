@@ -1,0 +1,2218 @@
+# Phase 7 — Returns/Cancellations Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Let any authenticated user cancel a completed sale (whole-sale, only before any return) or return individual sale-item quantities (partial, per line), restocking inventory and recording an `inventory_transactions` row and an `audit_logs` row for every unwind, inside one DB transaction per action — without ever deleting the sale or mutating its original totals. Also add full search/filter (sale number, SKU, date range, product, user, status) to `/sales`.
+
+**Architecture:** Two new service functions in `lib/services/sale.service.ts` (`returnSaleItems`, `cancelSale`) follow `completeSale`'s existing `db.transaction()` + `SELECT ... FOR UPDATE` pattern, sharing one internal helper for the restock/inventory-transaction/audit-log/status-recompute steps. New repo functions in `lib/repositories/sale.repo.ts` and a new `lib/repositories/audit-log.repo.ts` support them. Two new Server Actions expose them following the existing `{ok, ...}`-return-not-throw convention. `/sales/[id]` gets a Cancel button and a Return dialog; `/sales` gets a URL-param-driven filter bar.
+
+**Tech Stack:** Next.js 16 (App Router, Server Actions), Drizzle ORM (`drizzle-orm/node-postgres`), PostgreSQL (Railway), Zod validation, Vitest + Testing Library, shadcn/base-ui components.
+
+**Spec:** [`docs/superpowers/specs/2026-09-25-phase7-returns-design.md`](../specs/2026-09-25-phase7-returns-design.md)
+
+## Global Constraints
+
+- Never physically delete a sale or sale item row — cancel/return only update `status`/`returnedQuantity` and insert new `inventory_transactions`/`audit_logs` rows.
+- `sales.totalAmount` / `totalCost` / `totalProfit` are immutable after `completeSale` — never write to them from `returnSaleItems`/`cancelSale`. Returned/net value is always derived on read.
+- Cancel is legal only when `sales.status === "COMPLETED"` (nothing returned yet). Return is legal when `status` is `"COMPLETED"` or `"PARTIALLY_RETURNED"`.
+- No required reason/notes field on the cancel/return UI or Server Action inputs — this is an explicit, confirmed design decision, not a gap to fill in.
+- Any authenticated user (`requireUser()`) may cancel or return — do not gate with `requireAdmin()`.
+- All service-layer mutations for a single cancel/return call happen inside one `db.transaction()` — no step may commit independently.
+- Server Actions return `{ok: false, error: string, ...}` on failure, never throw a typed service error past the action boundary — matches `completeSaleAction`'s established pattern (Phase 6 final-review fix).
+- Real-DB concurrency tests are unreliable on this project's Railway instance (transactions serialize for unexplained reasons) — locking-correctness tests must use the deterministic mock pattern from `tests/unit/inventory.service.concurrency.test.ts`, not a real-DB race attempt.
+
+## Review Focus
+
+- **Returning more than once across two separate calls, cumulatively exceeding the line's quantity.** E.g. line has `quantity: 5`, `returnedQuantity: 0`; call 1 returns 3 (now `returnedQuantity: 3`); call 2 requests 3 more (`3 > remaining(2)`) — must reject with `InvalidReturnQuantityError`, not silently clamp or allow `returnedQuantity` to exceed `quantity`. Covered in Task 2.
+- **A return request naming a `saleItemId` that doesn't belong to the given `saleId`** (or doesn't exist at all) — must reject cleanly, not silently skip the line or throw an unhandled DB error. Covered in Task 2.
+- **Cancelling a sale that has ANY partial return already applied.** Must reject with a distinct error even though the sale is not yet fully `RETURNED` — this is the one case that's easy to get backwards (checking `!== "RETURNED"` instead of `!== "COMPLETED"`). Covered in Task 2.
+- **A return request with an empty `items` array, or every line's quantity being `0`.** Must reject before touching the database rather than silently succeeding as a no-op that still writes an audit log. Covered in Task 2 and Task 5.
+- **Concurrent cancel/return calls against the SAME sale** (e.g. two tabs both submitting a return, or a cancel racing a return) — the row lock on `sales` (and `sale_items`) must serialize them so the second call sees the first's already-updated `returnedQuantity`/`status`, never a stale pre-transaction value. Covered in Task 2's deterministic mock test (same technique as `inventory.service.concurrency.test.ts`).
+
+---
+
+## File Structure
+
+- **Modify** `lib/db/schema.ts` — add `PARTIALLY_RETURNED` to `saleStatusEnum`, add `returnedQuantity` column to `saleItems`. (`RETURN` already exists on `inventoryTransactionTypeEnum` since Phase 1 — no change needed there.)
+- **Create** `drizzle/0002_<generated-name>.sql` — migration generated by `drizzle-kit generate`, not hand-written.
+- **Modify** `lib/services/sale.service.ts` — add `returnSaleItems`, `cancelSale`, new typed errors (`SaleNotFoundError`, `SaleNotCancellableError`, `InvalidReturnQuantityError`), and a shared private `applyReturn` helper.
+- **Modify** `lib/repositories/sale.repo.ts` — add `findSaleForUpdate`, `findSaleItemsForUpdate`, `updateSaleItemReturnedQuantity`, `updateSaleStatus`; extend `listSales`/`countSales` with filter params.
+- **Create** `lib/repositories/audit-log.repo.ts` — `insertAuditLog`.
+- **Modify** `lib/actions/sale.actions.ts` — add `returnSaleItemsAction`, `cancelSaleAction`.
+- **Create** `lib/validation/return.schema.ts` — Zod schemas for the two new action inputs.
+- **Modify** `app/(app)/sales/[id]/page.tsx` — Cancel button, Return dialog, derived returned/net display, extended status badge.
+- **Create** `components/sales/CancelSaleButton.tsx`, `components/sales/ReturnItemsDialog.tsx` — client components for the two new actions on the detail page.
+- **Modify** `app/(app)/sales/page.tsx` — filter bar (URL-param-driven), wired to extended `listSales`/`countSales`.
+- **Create** `components/sales/SalesFilterBar.tsx` — client component rendering the filter form.
+- **Create** `components/ui/dialog.tsx` — shadcn dialog primitive (none exists yet in this repo).
+- **Modify** `lib/repositories/user.repo.ts` — add `listUsersForFilter` (id + name pairs, for the user filter's `<select>` options).
+
+---
+
+### Task 1: Schema migration — `PARTIALLY_RETURNED` status and `returned_quantity` column
+
+**Files:**
+- Modify: `lib/db/schema.ts:29` (saleStatusEnum), `lib/db/schema.ts:110-123` (saleItems table)
+- Create: `drizzle/0002_<name>.sql` (generated, not hand-written)
+- Test: `tests/integration/sale.repo.test.ts` (new describe block, schema-level smoke check)
+
+**Interfaces:**
+- Produces: `saleStatusEnum` values `"COMPLETED" | "CANCELLED" | "PARTIALLY_RETURNED" | "RETURNED"`; `saleItems.returnedQuantity: integer, notNull, default 0`. Every later task's TypeScript types (`SaleItemRow`) automatically pick this column up via `typeof saleItems.$inferSelect`.
+
+- [ ] **Step 1: Update the enum and add the column in `lib/db/schema.ts`**
+
+Change line 29 from:
+```ts
+export const saleStatusEnum = pgEnum("sale_status", ["COMPLETED", "CANCELLED", "RETURNED"]);
+```
+to:
+```ts
+export const saleStatusEnum = pgEnum("sale_status", ["COMPLETED", "CANCELLED", "PARTIALLY_RETURNED", "RETURNED"]);
+```
+
+In the `saleItems` table definition (around line 110-123), add the new column after `profit`:
+```ts
+export const saleItems = pgTable("sale_items", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  saleId: uuid("sale_id").notNull().references(() => sales.id),
+  productId: uuid("product_id").notNull().references(() => products.id),
+  quantity: integer("quantity").notNull(),
+  costPerUnit: numeric("cost_per_unit", { precision: 12, scale: 2 }).notNull(),
+  soldPricePerUnit: numeric("sold_price_per_unit", { precision: 12, scale: 2 }).notNull(),
+  totalCost: numeric("total_cost", { precision: 12, scale: 2 }).notNull(),
+  totalRevenue: numeric("total_revenue", { precision: 12, scale: 2 }).notNull(),
+  profit: numeric("profit", { precision: 12, scale: 2 }).notNull(),
+  returnedQuantity: integer("returned_quantity").notNull().default(0),
+}, (table) => [
+  index("sale_items_sale_id_idx").on(table.saleId),
+  index("sale_items_product_id_idx").on(table.productId),
+]);
+```
+
+- [ ] **Step 2: Generate the migration**
+
+Run: `npx drizzle-kit generate`
+Expected: a new `drizzle/0002_<auto-generated-name>.sql` file is created containing `ALTER TYPE "public"."sale_status" ADD VALUE 'PARTIALLY_RETURNED';` and `ALTER TABLE "sale_items" ADD COLUMN "returned_quantity" integer DEFAULT 0 NOT NULL;` (drizzle-kit picks the exact statement order/wording — verify both statements are present, don't hand-edit the file).
+
+- [ ] **Step 3: Apply the migration to the dev database**
+
+Run: `npx drizzle-kit migrate`
+Expected: migration applies with no errors. If it fails because Postgres won't allow `ADD VALUE` inside the same transaction as other DDL in some drizzle-kit versions, split is handled automatically by drizzle-kit's statement-breakpoint mechanism — do not manually work around this; if it genuinely fails, stop and report the exact error rather than hand-patching the generated SQL.
+
+- [ ] **Step 4: Write a smoke-check test confirming the new column and enum value are usable**
+
+Add to `tests/integration/sale.repo.test.ts` (new describe block near the top, after existing imports — check the file's existing test setup/teardown helpers for creating a test sale and reuse them rather than duplicating setup):
+
+```ts
+describe("schema: returned_quantity column and PARTIALLY_RETURNED status", () => {
+  it("allows inserting a sale_item with an explicit returnedQuantity and defaults to 0 when omitted", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}`,
+      soldBy: testUserId, // reuse whatever existing test-user fixture this file already uses
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "COMPLETED",
+    });
+    const [item] = await insertSaleItems([{
+      saleId: sale.id,
+      productId: testProductId, // reuse whatever existing test-product fixture this file already uses
+      quantity: 3,
+      costPerUnit: "1.00",
+      soldPricePerUnit: "2.00",
+      totalCost: "3.00",
+      totalRevenue: "6.00",
+      profit: "3.00",
+    }]);
+    expect(item.returnedQuantity).toBe(0);
+  });
+
+  it("allows updating a sale's status to PARTIALLY_RETURNED", async () => {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Date.now()}-2`,
+      soldBy: testUserId,
+      totalAmount: "10.00",
+      totalCost: "5.00",
+      totalProfit: "5.00",
+      status: "PARTIALLY_RETURNED",
+    });
+    expect(sale.status).toBe("PARTIALLY_RETURNED");
+  });
+});
+```
+
+Adjust `testUserId`/`testProductId` to whatever fixture variables/helpers the existing file already establishes (read the file's current `beforeAll`/`beforeEach` setup before writing this step's final code — do not invent new fixture names that collide with existing ones).
+
+- [ ] **Step 5: Run the test to verify it passes**
+
+Run: `npx vitest run tests/integration/sale.repo.test.ts`
+Expected: PASS (both new tests green; pre-existing tests in the file unaffected — note the pre-existing `findSaleById` ordering-by-UUID test failure documented in project memory is a known pre-existing issue unrelated to this change, not something this task should fix).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/db/schema.ts drizzle/ tests/integration/sale.repo.test.ts
+git commit -m "Add PARTIALLY_RETURNED sale status and sale_items.returned_quantity column"
+```
+
+---
+
+### Task 2: Service layer — `returnSaleItems` and `cancelSale`
+
+**Files:**
+- Modify: `lib/services/sale.service.ts`
+- Test: `tests/unit/sale.service.test.ts`
+
+**Interfaces:**
+- Consumes: `lib/repositories/sale.repo.ts`'s `findSaleForUpdate(id, tx)`, `findSaleItemsForUpdate(saleId, tx)`, `updateSaleItemReturnedQuantity(saleItemId, newReturnedQuantity, tx)`, `updateSaleStatus(saleId, status, tx)` (all from Task 3 — write this task's tests against these exact signatures now via mocks; Task 3 implements the real versions against the same signatures). `lib/repositories/inventory.repo.ts`'s existing `insertInventoryTransaction(data, executor)`. `lib/repositories/audit-log.repo.ts`'s `insertAuditLog(data, executor)` (Task 4 — same "write against the signature now" approach). `products` table's `currentQuantity` column via `db`/`tx.update`.
+- Produces:
+  ```ts
+  export class SaleNotFoundError extends Error {
+    constructor(public readonly saleId: string) { super(`Sale not found: ${saleId}`); this.name = "SaleNotFoundError"; }
+  }
+  export class SaleNotCancellableError extends Error {
+    constructor(public readonly saleId: string, public readonly currentStatus: string) {
+      super(`Sale ${saleId} cannot be cancelled (status: ${currentStatus})`);
+      this.name = "SaleNotCancellableError";
+    }
+  }
+  export class InvalidReturnQuantityError extends Error {
+    constructor(public readonly saleItemId: string, public readonly requested: number, public readonly remaining: number) {
+      super(`Invalid return quantity for sale item ${saleItemId}: requested ${requested}, only ${remaining} remaining`);
+      this.name = "InvalidReturnQuantityError";
+    }
+  }
+
+  export type ReturnSaleItemsInput = {
+    saleId: string;
+    userId: string;
+    items: { saleItemId: string; quantity: number }[];
+  };
+  export async function returnSaleItems(input: ReturnSaleItemsInput): Promise<SaleWithItems>;
+
+  export type CancelSaleInput = { saleId: string; userId: string };
+  export async function cancelSale(input: CancelSaleInput): Promise<SaleWithItems>;
+  ```
+  Both reuse the existing `SaleWithItems` type already exported from this file (Phase 6).
+
+- [ ] **Step 1: Write failing tests for `returnSaleItems` happy path and validation**
+
+Add to `tests/unit/sale.service.test.ts` (this file already mocks `@/lib/repositories/sale.repo` and `@/lib/repositories/inventory.repo` for `completeSale`'s tests — extend those same `vi.mock` blocks rather than creating new ones; read the file's existing mock setup first and match its exact mock style):
+
+```ts
+describe("returnSaleItems", () => {
+  const baseSale = {
+    id: "sale-1",
+    saleNumber: "SALE-000001",
+    status: "COMPLETED" as const,
+  };
+  const baseItem = {
+    id: "item-1",
+    saleId: "sale-1",
+    productId: "prod-1",
+    quantity: 5,
+    returnedQuantity: 0,
+    soldPricePerUnit: "10.00",
+    costPerUnit: "6.00",
+  };
+
+  beforeEach(() => {
+    vi.mocked(db.transaction).mockImplementation(async (cb) => cb(fakeTx as never));
+    vi.mocked(findSaleForUpdate).mockResolvedValue({ ...baseSale } as never);
+    vi.mocked(findSaleItemsForUpdate).mockResolvedValue([{ ...baseItem }] as never);
+    vi.mocked(updateSaleItemReturnedQuantity).mockResolvedValue(undefined as never);
+    vi.mocked(updateSaleStatus).mockResolvedValue(undefined as never);
+    vi.mocked(insertInventoryTransaction).mockResolvedValue(undefined as never);
+    vi.mocked(insertAuditLog).mockResolvedValue(undefined as never);
+  });
+
+  it("returns partial quantity on one line, restocks inventory, and sets status to PARTIALLY_RETURNED", async () => {
+    await returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 2 }] });
+
+    expect(updateSaleItemReturnedQuantity).toHaveBeenCalledWith("item-1", 2, expect.anything());
+    expect(insertInventoryTransaction).toHaveBeenCalledWith(
+      expect.objectContaining({ productId: "prod-1", type: "RETURN", quantity: 2, referenceId: "sale-1" }),
+      expect.anything()
+    );
+    expect(updateSaleStatus).toHaveBeenCalledWith("sale-1", "PARTIALLY_RETURNED", expect.anything());
+    expect(insertAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "SALE_RETURNED", entityType: "sale", entityId: "sale-1", userId: "user-1" }),
+      expect.anything()
+    );
+  });
+
+  it("sets status to RETURNED when the returned quantity covers everything outstanding", async () => {
+    await returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 5 }] });
+    expect(updateSaleStatus).toHaveBeenCalledWith("sale-1", "RETURNED", expect.anything());
+  });
+
+  it("rejects a return quantity exceeding what remains on the line", async () => {
+    vi.mocked(findSaleItemsForUpdate).mockResolvedValue([{ ...baseItem, returnedQuantity: 3 }] as never);
+    await expect(
+      returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 3 }] })
+    ).rejects.toBeInstanceOf(InvalidReturnQuantityError);
+    expect(updateSaleItemReturnedQuantity).not.toHaveBeenCalled();
+    expect(insertInventoryTransaction).not.toHaveBeenCalled();
+  });
+
+  it("rejects a zero or negative return quantity", async () => {
+    await expect(
+      returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 0 }] })
+    ).rejects.toBeInstanceOf(InvalidReturnQuantityError);
+  });
+
+  it("rejects a saleItemId that isn't part of this sale", async () => {
+    await expect(
+      returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "not-real", quantity: 1 }] })
+    ).rejects.toBeInstanceOf(InvalidReturnQuantityError);
+  });
+
+  it("rejects when the sale is not found", async () => {
+    vi.mocked(findSaleForUpdate).mockResolvedValue(undefined as never);
+    await expect(
+      returnSaleItems({ saleId: "missing", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 1 }] })
+    ).rejects.toBeInstanceOf(SaleNotFoundError);
+  });
+
+  it("rejects when the sale is already CANCELLED or RETURNED", async () => {
+    vi.mocked(findSaleForUpdate).mockResolvedValue({ ...baseSale, status: "CANCELLED" } as never);
+    await expect(
+      returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 1 }] })
+    ).rejects.toThrow();
+  });
+
+  it("rejects an empty items array before touching the database", async () => {
+    await expect(
+      returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [] })
+    ).rejects.toThrow();
+    expect(updateSaleItemReturnedQuantity).not.toHaveBeenCalled();
+  });
+
+  it("validates every line before writing any, rolling back on one bad line among several", async () => {
+    vi.mocked(findSaleItemsForUpdate).mockResolvedValue([
+      { ...baseItem, id: "item-1", returnedQuantity: 0 },
+      { ...baseItem, id: "item-2", quantity: 1, returnedQuantity: 1 }, // already fully returned
+    ] as never);
+    await expect(
+      returnSaleItems({
+        saleId: "sale-1",
+        userId: "user-1",
+        items: [{ saleItemId: "item-1", quantity: 2 }, { saleItemId: "item-2", quantity: 1 }],
+      })
+    ).rejects.toBeInstanceOf(InvalidReturnQuantityError);
+    expect(updateSaleItemReturnedQuantity).not.toHaveBeenCalled();
+  });
+});
+
+describe("cancelSale", () => {
+  const baseSale = { id: "sale-1", saleNumber: "SALE-000001", status: "COMPLETED" as const };
+  const items = [
+    { id: "item-1", saleId: "sale-1", productId: "prod-1", quantity: 5, returnedQuantity: 0, soldPricePerUnit: "10.00", costPerUnit: "6.00" },
+    { id: "item-2", saleId: "sale-1", productId: "prod-2", quantity: 2, returnedQuantity: 0, soldPricePerUnit: "20.00", costPerUnit: "12.00" },
+  ];
+
+  beforeEach(() => {
+    vi.mocked(db.transaction).mockImplementation(async (cb) => cb(fakeTx as never));
+    vi.mocked(findSaleForUpdate).mockResolvedValue({ ...baseSale } as never);
+    vi.mocked(findSaleItemsForUpdate).mockResolvedValue(items.map((i) => ({ ...i })) as never);
+    vi.mocked(updateSaleItemReturnedQuantity).mockResolvedValue(undefined as never);
+    vi.mocked(updateSaleStatus).mockResolvedValue(undefined as never);
+    vi.mocked(insertInventoryTransaction).mockResolvedValue(undefined as never);
+    vi.mocked(insertAuditLog).mockResolvedValue(undefined as never);
+  });
+
+  it("restocks every line's full quantity and sets status to CANCELLED", async () => {
+    await cancelSale({ saleId: "sale-1", userId: "user-1" });
+
+    expect(updateSaleItemReturnedQuantity).toHaveBeenCalledWith("item-1", 5, expect.anything());
+    expect(updateSaleItemReturnedQuantity).toHaveBeenCalledWith("item-2", 2, expect.anything());
+    expect(insertInventoryTransaction).toHaveBeenCalledTimes(2);
+    expect(updateSaleStatus).toHaveBeenCalledWith("sale-1", "CANCELLED", expect.anything());
+    expect(insertAuditLog).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "SALE_CANCELLED", entityType: "sale", entityId: "sale-1" }),
+      expect.anything()
+    );
+  });
+
+  it("rejects cancelling a sale that already has a partial return", async () => {
+    vi.mocked(findSaleForUpdate).mockResolvedValue({ ...baseSale, status: "PARTIALLY_RETURNED" } as never);
+    await expect(cancelSale({ saleId: "sale-1", userId: "user-1" })).rejects.toBeInstanceOf(SaleNotCancellableError);
+    expect(updateSaleItemReturnedQuantity).not.toHaveBeenCalled();
+  });
+
+  it("rejects cancelling an already-CANCELLED sale", async () => {
+    vi.mocked(findSaleForUpdate).mockResolvedValue({ ...baseSale, status: "CANCELLED" } as never);
+    await expect(cancelSale({ saleId: "sale-1", userId: "user-1" })).rejects.toBeInstanceOf(SaleNotCancellableError);
+  });
+
+  it("rejects cancelling an already-RETURNED sale", async () => {
+    vi.mocked(findSaleForUpdate).mockResolvedValue({ ...baseSale, status: "RETURNED" } as never);
+    await expect(cancelSale({ saleId: "sale-1", userId: "user-1" })).rejects.toBeInstanceOf(SaleNotCancellableError);
+  });
+});
+
+describe("returnSaleItems — deterministic concurrent-call simulation", () => {
+  // Same technique as tests/unit/inventory.service.concurrency.test.ts for
+  // adjustInventory (see that file's header comment for the full rationale:
+  // real-DB concurrency tests are unreliable against this project's Railway
+  // instance, so the row lock's blocking effect is simulated directly by
+  // controlling exactly when each call's "select" and "update" resolve,
+  // rather than hoping two real calls happen to overlap). Here the shared
+  // mutable state is one sale_item's returnedQuantity instead of a
+  // product's currentQuantity, but the shape of the race — and what a
+  // correctly-locked service must do about it — is identical.
+  it("prevents two concurrent returns from double-counting when both target the same line", async () => {
+    let sharedReturnedQuantity = 0;
+    let firstCallStarted = false;
+    let releaseSecondRead!: () => void;
+    const secondReadGate = new Promise<void>((resolve) => {
+      releaseSecondRead = resolve;
+    });
+    let capturedLockStrength: string | undefined;
+
+    const sale = { id: "sale-1", saleNumber: "SALE-000001", status: "COMPLETED" as const };
+    const lineQuantity = 5; // both calls try to return 3; only the first may fully succeed as requested
+
+    vi.mocked(db.transaction).mockImplementation(async (callback) => {
+      const isFirstCall = !firstCallStarted;
+      firstCallStarted = true;
+
+      if (!isFirstCall) {
+        await secondReadGate; // second call's locked read blocks until the first call's transaction "commits"
+      }
+
+      const fakeTx = {} as never; // service calls findSaleForUpdate/findSaleItemsForUpdate/etc. via the mocked repo functions below, not tx methods directly, so the fake tx object itself only needs to be a distinguishable value passed through
+
+      vi.mocked(findSaleForUpdate).mockResolvedValueOnce({ ...sale } as never);
+      vi.mocked(findSaleItemsForUpdate).mockResolvedValueOnce([
+        { id: "item-1", saleId: "sale-1", productId: "prod-1", quantity: lineQuantity, returnedQuantity: sharedReturnedQuantity, soldPricePerUnit: "10.00", costPerUnit: "6.00" },
+      ] as never);
+      vi.mocked(updateSaleItemReturnedQuantity).mockImplementationOnce(async (_id, newQuantity) => {
+        sharedReturnedQuantity = newQuantity;
+      });
+
+      const result = await callback(fakeTx);
+
+      if (isFirstCall) {
+        releaseSecondRead(); // simulate the first transaction's commit releasing the row lock
+      }
+
+      return result;
+    });
+
+    const callA = returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 3 }] });
+    const callB = returnSaleItems({ saleId: "sale-1", userId: "user-1", items: [{ saleItemId: "item-1", quantity: 3 }] });
+
+    const results = await Promise.allSettled([callA, callB]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+
+    // With the lock's blocking behavior simulated: the first call sees
+    // returnedQuantity=0 (remaining=5, requesting 3 succeeds); the second
+    // call, blocked until the first commits, sees the now-updated
+    // returnedQuantity=3 (remaining=2, requesting 3 correctly rejected) —
+    // never both succeeding against the same stale remaining=5 snapshot,
+    // which would let 6 units be returned against a line that only sold 5.
+    expect(fulfilled.length).toBe(1);
+    expect(rejected.length).toBe(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toBeInstanceOf(InvalidReturnQuantityError);
+    expect(sharedReturnedQuantity).toBe(3);
+  });
+});
+```
+
+Add the corresponding imports at the top of the test file (extend existing import statements rather than duplicating):
+```ts
+import {
+  returnSaleItems,
+  cancelSale,
+  SaleNotFoundError,
+  SaleNotCancellableError,
+  InvalidReturnQuantityError,
+} from "@/lib/services/sale.service";
+import {
+  findSaleForUpdate,
+  findSaleItemsForUpdate,
+  updateSaleItemReturnedQuantity,
+  updateSaleStatus,
+} from "@/lib/repositories/sale.repo";
+import { insertAuditLog } from "@/lib/repositories/audit-log.repo";
+```
+And extend the file's existing `vi.mock("@/lib/repositories/sale.repo", ...)` and `vi.mock("@/lib/repositories/inventory.repo", ...)` factory objects to also export mocked versions of these new functions (`vi.fn()` for each), plus add `vi.mock("@/lib/repositories/audit-log.repo", () => ({ insertAuditLog: vi.fn() }))`. Also define a minimal `fakeTx` object (an empty object is sufficient — the mocked repo functions ignore their `tx` argument's shape in these tests) near the top of the new describe blocks or reuse one if the file already defines one for `completeSale`'s tests.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `npx vitest run tests/unit/sale.service.test.ts`
+Expected: FAIL — `returnSaleItems`, `cancelSale`, `SaleNotFoundError`, `SaleNotCancellableError`, `InvalidReturnQuantityError` are not exported from `lib/services/sale.service.ts` yet.
+
+- [ ] **Step 3: Implement `returnSaleItems`, `cancelSale`, and the shared helper**
+
+Add to `lib/services/sale.service.ts` (below the existing `completeSale` function; add new imports at the top alongside the existing ones):
+
+```ts
+import {
+  findSaleForUpdate,
+  findSaleItemsForUpdate,
+  updateSaleItemReturnedQuantity,
+  updateSaleStatus,
+} from "@/lib/repositories/sale.repo";
+import { insertAuditLog } from "@/lib/repositories/audit-log.repo";
+
+export class SaleNotFoundError extends Error {
+  constructor(public readonly saleId: string) {
+    super(`Sale not found: ${saleId}`);
+    this.name = "SaleNotFoundError";
+  }
+}
+
+export class SaleNotCancellableError extends Error {
+  constructor(public readonly saleId: string, public readonly currentStatus: string) {
+    super(`Sale ${saleId} cannot be cancelled (status: ${currentStatus})`);
+    this.name = "SaleNotCancellableError";
+  }
+}
+
+export class InvalidReturnQuantityError extends Error {
+  constructor(
+    public readonly saleItemId: string,
+    public readonly requested: number,
+    public readonly remaining: number
+  ) {
+    super(
+      `Invalid return quantity for sale item ${saleItemId}: requested ${requested}, only ${remaining} remaining`
+    );
+    this.name = "InvalidReturnQuantityError";
+  }
+}
+
+export type ReturnSaleItemsInput = {
+  saleId: string;
+  userId: string;
+  items: { saleItemId: string; quantity: number }[];
+};
+
+// Shared by returnSaleItems and cancelSale: given a locked sale + its locked
+// items, and the exact per-line quantities to return, restocks inventory,
+// records one inventory_transactions row per line, recomputes and writes
+// the sale's status, and writes one audit_logs row for the whole action.
+// Callers must have already validated every line — this function performs
+// no validation of its own, only mutation, so it can't partially apply a
+// request its caller already accepted.
+async function applyReturn(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  params: {
+    sale: SaleRow;
+    items: SaleItemRow[];
+    toReturn: Map<string, number>; // saleItemId -> quantity to return now
+    userId: string;
+    action: "SALE_RETURNED" | "SALE_CANCELLED";
+    noteVerb: string; // "Return against" | "Cancelled"
+  }
+): Promise<SaleWithItems> {
+  const itemById = new Map(params.items.map((item) => [item.id, item]));
+
+  for (const [saleItemId, quantity] of params.toReturn) {
+    const item = itemById.get(saleItemId)!;
+    const newReturnedQuantity = item.returnedQuantity + quantity;
+
+    await updateSaleItemReturnedQuantity(saleItemId, newReturnedQuantity, tx);
+
+    await tx
+      .update(products)
+      .set({
+        currentQuantity: sql`${products.currentQuantity} + ${quantity}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(products.id, item.productId));
+
+    await insertInventoryTransaction(
+      {
+        productId: item.productId,
+        type: "RETURN",
+        quantity,
+        referenceId: params.sale.id,
+        notes: `${params.noteVerb} Sale ${params.sale.saleNumber}`,
+        createdBy: params.userId,
+      },
+      tx
+    );
+
+    item.returnedQuantity = newReturnedQuantity; // keep local copy in sync for the status computation below
+  }
+
+  const allReturned = params.items.every((item) => item.returnedQuantity >= item.quantity);
+  const anyReturned = params.items.some((item) => item.returnedQuantity > 0);
+  const newStatus = params.action === "SALE_CANCELLED"
+    ? "CANCELLED"
+    : allReturned
+      ? "RETURNED"
+      : anyReturned
+        ? "PARTIALLY_RETURNED"
+        : params.sale.status; // unreachable in practice (toReturn is always non-empty), kept for type-safety
+
+  await updateSaleStatus(params.sale.id, newStatus, tx);
+
+  await insertAuditLog(
+    {
+      userId: params.userId,
+      action: params.action,
+      entityType: "sale",
+      entityId: params.sale.id,
+      metadata: {
+        items: [...params.toReturn.entries()].map(([saleItemId, quantity]) => ({
+          saleItemId,
+          productId: itemById.get(saleItemId)!.productId,
+          quantity,
+        })),
+        resultingStatus: newStatus,
+      },
+    },
+    tx
+  );
+
+  return { ...params.sale, status: newStatus, items: params.items };
+}
+
+export async function returnSaleItems(input: ReturnSaleItemsInput): Promise<SaleWithItems> {
+  if (input.items.length === 0) {
+    throw new InvalidReturnQuantityError("(none)", 0, 0);
+  }
+
+  return db.transaction(async (tx) => {
+    const sale = await findSaleForUpdate(input.saleId, tx);
+    if (!sale) {
+      throw new SaleNotFoundError(input.saleId);
+    }
+    if (sale.status !== "COMPLETED" && sale.status !== "PARTIALLY_RETURNED") {
+      throw new SaleNotCancellableError(input.saleId, sale.status);
+    }
+
+    const items = await findSaleItemsForUpdate(input.saleId, tx);
+    const itemById = new Map(items.map((item) => [item.id, item]));
+
+    // Validate every requested line BEFORE writing anything — a single bad
+    // line must roll back the whole call, not apply the valid lines and
+    // skip the bad one.
+    const toReturn = new Map<string, number>();
+    for (const { saleItemId, quantity } of input.items) {
+      const item = itemById.get(saleItemId);
+      const remaining = item ? item.quantity - item.returnedQuantity : 0;
+      if (!item || quantity <= 0 || quantity > remaining) {
+        throw new InvalidReturnQuantityError(saleItemId, quantity, remaining);
+      }
+      toReturn.set(saleItemId, (toReturn.get(saleItemId) ?? 0) + quantity);
+    }
+
+    return applyReturn(tx, {
+      sale,
+      items,
+      toReturn,
+      userId: input.userId,
+      action: "SALE_RETURNED",
+      noteVerb: "Return against",
+    });
+  });
+}
+
+export type CancelSaleInput = { saleId: string; userId: string };
+
+export async function cancelSale(input: CancelSaleInput): Promise<SaleWithItems> {
+  return db.transaction(async (tx) => {
+    const sale = await findSaleForUpdate(input.saleId, tx);
+    if (!sale) {
+      throw new SaleNotFoundError(input.saleId);
+    }
+    if (sale.status !== "COMPLETED") {
+      throw new SaleNotCancellableError(input.saleId, sale.status);
+    }
+
+    const items = await findSaleItemsForUpdate(input.saleId, tx);
+    const toReturn = new Map(items.map((item) => [item.id, item.quantity - item.returnedQuantity]));
+
+    return applyReturn(tx, {
+      sale,
+      items,
+      toReturn,
+      userId: input.userId,
+      action: "SALE_CANCELLED",
+      noteVerb: "Cancelled",
+    });
+  });
+}
+```
+
+Note: `sql` needs to be imported from `drizzle-orm` at the top of the file if not already present (check the existing import line — `completeSale` already imports `sql, eq, inArray, asc` from `drizzle-orm`, so this likely just reuses that same import line without changes).
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `npx vitest run tests/unit/sale.service.test.ts`
+Expected: PASS (all `returnSaleItems`/`cancelSale` tests green, all pre-existing `completeSale` tests in the same file still green).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/services/sale.service.ts tests/unit/sale.service.test.ts
+git commit -m "Add returnSaleItems and cancelSale to sale.service.ts"
+```
+
+---
+
+### Task 3: Repository layer — locked fetch/update helpers and filtered `listSales`
+
+**Files:**
+- Modify: `lib/repositories/sale.repo.ts`
+- Modify: `lib/repositories/user.repo.ts`
+- Test: `tests/integration/sale.repo.test.ts`
+
+**Interfaces:**
+- Consumes: `sales`, `saleItems`, `products`, `users` tables from `lib/db/schema.ts`; `DbOrTx` type from `lib/repositories/inventory.repo.ts` (already exported there, already imported by `sale.repo.ts`).
+- Produces:
+  ```ts
+  export async function findSaleForUpdate(id: string, tx: DbOrTx): Promise<SaleRow | undefined>;
+  export async function findSaleItemsForUpdate(saleId: string, tx: DbOrTx): Promise<SaleItemRow[]>;
+  export async function updateSaleItemReturnedQuantity(saleItemId: string, newReturnedQuantity: number, tx: DbOrTx): Promise<void>;
+  export async function updateSaleStatus(saleId: string, status: SaleRow["status"], tx: DbOrTx): Promise<void>;
+
+  export type ListSalesParams = {
+    limit: number;
+    offset: number;
+    query?: string; // matches sale number OR any line's product SKU
+    dateFrom?: Date;
+    dateTo?: Date;
+    productId?: string;
+    userId?: string;
+    status?: SaleRow["status"];
+  };
+  export async function listSales(params: ListSalesParams): Promise<SaleRow[]>; // signature change from Task-6-era { limit, offset }
+  export async function countSales(params: Omit<ListSalesParams, "limit" | "offset">): Promise<number>; // signature change from Task-6-era no-args
+  ```
+  and in `lib/repositories/user.repo.ts`:
+  ```ts
+  export async function listUsersForFilter(): Promise<{ id: string; name: string }[]>;
+  ```
+
+- [ ] **Step 1: Write failing tests for the locked fetch/update helpers**
+
+Add to `tests/integration/sale.repo.test.ts` (reuse the file's existing test-sale/test-product creation helpers — read them first):
+
+```ts
+describe("findSaleForUpdate / findSaleItemsForUpdate / updateSaleItemReturnedQuantity / updateSaleStatus", () => {
+  it("findSaleForUpdate returns the sale row inside a transaction", async () => {
+    const sale = await insertSale({ /* ...same fixture shape as Task 1's test... */ saleNumber: `TEST-${Date.now()}`, soldBy: testUserId, totalAmount: "10.00", totalCost: "5.00", totalProfit: "5.00", status: "COMPLETED" });
+    await db.transaction(async (tx) => {
+      const found = await findSaleForUpdate(sale.id, tx);
+      expect(found?.id).toBe(sale.id);
+    });
+  });
+
+  it("findSaleForUpdate returns undefined for a missing id", async () => {
+    await db.transaction(async (tx) => {
+      const found = await findSaleForUpdate("00000000-0000-0000-0000-000000000000", tx);
+      expect(found).toBeUndefined();
+    });
+  });
+
+  it("findSaleItemsForUpdate returns items ordered by id ascending", async () => {
+    const sale = await insertSale({ saleNumber: `TEST-${Date.now()}-i`, soldBy: testUserId, totalAmount: "10.00", totalCost: "5.00", totalProfit: "5.00", status: "COMPLETED" });
+    const inserted = await insertSaleItems([
+      { saleId: sale.id, productId: testProductId, quantity: 2, costPerUnit: "1.00", soldPricePerUnit: "2.00", totalCost: "2.00", totalRevenue: "4.00", profit: "2.00" },
+      { saleId: sale.id, productId: testProductId, quantity: 1, costPerUnit: "1.00", soldPricePerUnit: "2.00", totalCost: "1.00", totalRevenue: "2.00", profit: "1.00" },
+    ]);
+    await db.transaction(async (tx) => {
+      const items = await findSaleItemsForUpdate(sale.id, tx);
+      expect(items.map((i) => i.id)).toEqual([...inserted.map((i) => i.id)].sort());
+    });
+  });
+
+  it("updateSaleItemReturnedQuantity persists the new value", async () => {
+    const sale = await insertSale({ saleNumber: `TEST-${Date.now()}-r`, soldBy: testUserId, totalAmount: "10.00", totalCost: "5.00", totalProfit: "5.00", status: "COMPLETED" });
+    const [item] = await insertSaleItems([{ saleId: sale.id, productId: testProductId, quantity: 5, costPerUnit: "1.00", soldPricePerUnit: "2.00", totalCost: "5.00", totalRevenue: "10.00", profit: "5.00" }]);
+    await db.transaction(async (tx) => {
+      await updateSaleItemReturnedQuantity(item.id, 3, tx);
+    });
+    const reloaded = await findSaleById(sale.id);
+    expect(reloaded?.items[0].returnedQuantity).toBe(3);
+  });
+
+  it("updateSaleStatus persists the new status", async () => {
+    const sale = await insertSale({ saleNumber: `TEST-${Date.now()}-s`, soldBy: testUserId, totalAmount: "10.00", totalCost: "5.00", totalProfit: "5.00", status: "COMPLETED" });
+    await db.transaction(async (tx) => {
+      await updateSaleStatus(sale.id, "CANCELLED", tx);
+    });
+    const reloaded = await findSaleById(sale.id);
+    expect(reloaded?.status).toBe("CANCELLED");
+  });
+});
+```
+
+Note: `findSaleItemsForUpdate`'s test sorts `inserted.map(i => i.id)` client-side to compare against ascending id order — this mirrors the SAME UUID-sort caveat already documented as a pre-existing issue in this file's `findSaleById` test (see project memory: UUID `id` order is not insertion order). This test is intentionally about DB-level ascending-by-id ordering, not insertion order, so sorting the expected array is correct here, not a workaround.
+
+- [ ] **Step 2: Write failing tests for filtered `listSales`/`countSales`**
+
+Add to the same file:
+
+```ts
+describe("listSales / countSales filters", () => {
+  it("filters by status", async () => {
+    const completed = await insertSale({ saleNumber: `TEST-${Date.now()}-f1`, soldBy: testUserId, totalAmount: "1.00", totalCost: "1.00", totalProfit: "0.00", status: "COMPLETED" });
+    const cancelled = await insertSale({ saleNumber: `TEST-${Date.now()}-f2`, soldBy: testUserId, totalAmount: "1.00", totalCost: "1.00", totalProfit: "0.00", status: "CANCELLED" });
+
+    const results = await listSales({ limit: 50, offset: 0, status: "CANCELLED" });
+    const ids = results.map((s) => s.id);
+    expect(ids).toContain(cancelled.id);
+    expect(ids).not.toContain(completed.id);
+
+    const total = await countSales({ status: "CANCELLED" });
+    expect(total).toBeGreaterThanOrEqual(1);
+  });
+
+  it("filters by sale number query match", async () => {
+    const uniqueNumber = `TEST-UNIQUE-${Date.now()}`;
+    const sale = await insertSale({ saleNumber: uniqueNumber, soldBy: testUserId, totalAmount: "1.00", totalCost: "1.00", totalProfit: "0.00", status: "COMPLETED" });
+    const results = await listSales({ limit: 50, offset: 0, query: uniqueNumber });
+    expect(results.map((s) => s.id)).toEqual([sale.id]);
+  });
+
+  it("filters by product id (via sale_items join)", async () => {
+    const sale = await insertSale({ saleNumber: `TEST-${Date.now()}-p`, soldBy: testUserId, totalAmount: "1.00", totalCost: "1.00", totalProfit: "0.00", status: "COMPLETED" });
+    await insertSaleItems([{ saleId: sale.id, productId: testProductId, quantity: 1, costPerUnit: "1.00", soldPricePerUnit: "1.00", totalCost: "1.00", totalRevenue: "1.00", profit: "0.00" }]);
+    const results = await listSales({ limit: 50, offset: 0, productId: testProductId });
+    expect(results.map((s) => s.id)).toContain(sale.id);
+  });
+
+  it("filters by user id", async () => {
+    const results = await listSales({ limit: 50, offset: 0, userId: testUserId });
+    expect(results.every((s) => s.soldBy === testUserId)).toBe(true);
+  });
+
+  it("filters by date range", async () => {
+    const results = await listSales({
+      limit: 50,
+      offset: 0,
+      dateFrom: new Date(Date.now() - 24 * 60 * 60 * 1000),
+      dateTo: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
+    expect(results.length).toBeGreaterThanOrEqual(0); // sanity: query executes without error and returns an array
+  });
+
+  it("combines two filters with AND semantics", async () => {
+    const results = await listSales({ limit: 50, offset: 0, status: "COMPLETED", userId: testUserId });
+    expect(results.every((s) => s.status === "COMPLETED" && s.soldBy === testUserId)).toBe(true);
+  });
+
+  it("returns an empty array when filters match nothing", async () => {
+    const results = await listSales({ limit: 50, offset: 0, query: "NO-SUCH-SALE-NUMBER-XYZ" });
+    expect(results).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `npx vitest run tests/integration/sale.repo.test.ts`
+Expected: FAIL — new exports don't exist yet; `listSales`/`countSales` calls with the new params object don't match the old `{ limit, offset }`-only / no-args signatures.
+
+- [ ] **Step 4: Implement the repository changes**
+
+Replace the full contents of `lib/repositories/sale.repo.ts`:
+
+```ts
+import { db } from "@/lib/db/client";
+import { sales, saleItems, products } from "@/lib/db/schema";
+import { eq, desc, count, asc, inArray, and, gte, lte, or, ilike, type SQL } from "drizzle-orm";
+import type { DbOrTx } from "./inventory.repo";
+
+export type SaleRow = typeof sales.$inferSelect;
+export type NewSale = typeof sales.$inferInsert;
+export type SaleItemRow = typeof saleItems.$inferSelect;
+export type NewSaleItem = typeof saleItems.$inferInsert;
+
+export async function insertSale(data: NewSale, executor: DbOrTx = db): Promise<SaleRow> {
+  const [row] = await executor.insert(sales).values(data).returning();
+  return row;
+}
+
+export async function insertSaleItems(
+  data: NewSaleItem[],
+  executor: DbOrTx = db
+): Promise<SaleItemRow[]> {
+  return executor.insert(saleItems).values(data).returning();
+}
+
+export async function findSaleForUpdate(id: string, tx: DbOrTx): Promise<SaleRow | undefined> {
+  const [row] = await tx.select().from(sales).where(eq(sales.id, id)).for("update");
+  return row;
+}
+
+export async function findSaleItemsForUpdate(saleId: string, tx: DbOrTx): Promise<SaleItemRow[]> {
+  return tx
+    .select()
+    .from(saleItems)
+    .where(eq(saleItems.saleId, saleId))
+    .orderBy(asc(saleItems.id))
+    .for("update");
+}
+
+export async function updateSaleItemReturnedQuantity(
+  saleItemId: string,
+  newReturnedQuantity: number,
+  tx: DbOrTx
+): Promise<void> {
+  await tx
+    .update(saleItems)
+    .set({ returnedQuantity: newReturnedQuantity })
+    .where(eq(saleItems.id, saleItemId));
+}
+
+export async function updateSaleStatus(
+  saleId: string,
+  status: SaleRow["status"],
+  tx: DbOrTx
+): Promise<void> {
+  await tx.update(sales).set({ status }).where(eq(sales.id, saleId));
+}
+
+export type ListSalesParams = {
+  limit: number;
+  offset: number;
+  query?: string;
+  dateFrom?: Date;
+  dateTo?: Date;
+  productId?: string;
+  userId?: string;
+  status?: SaleRow["status"];
+};
+
+function buildSalesFilters(params: Omit<ListSalesParams, "limit" | "offset">): SQL | undefined {
+  const filters: SQL[] = [];
+
+  if (params.status) filters.push(eq(sales.status, params.status));
+  if (params.userId) filters.push(eq(sales.soldBy, params.userId));
+  if (params.dateFrom) filters.push(gte(sales.soldAt, params.dateFrom));
+  if (params.dateTo) filters.push(lte(sales.soldAt, params.dateTo));
+
+  if (params.query && params.query.trim().length > 0) {
+    const term = `%${params.query.trim()}%`;
+    const queryFilter = or(
+      ilike(sales.saleNumber, term),
+      inArray(
+        sales.id,
+        db.select({ id: saleItems.saleId }).from(saleItems).innerJoin(products, eq(saleItems.productId, products.id)).where(ilike(products.sku, term))
+      )
+    );
+    if (queryFilter) filters.push(queryFilter);
+  }
+
+  if (params.productId) {
+    filters.push(
+      inArray(
+        sales.id,
+        db.select({ id: saleItems.saleId }).from(saleItems).where(eq(saleItems.productId, params.productId))
+      )
+    );
+  }
+
+  return filters.length > 0 ? and(...filters) : undefined;
+}
+
+export async function listSales(params: ListSalesParams): Promise<SaleRow[]> {
+  return db
+    .select()
+    .from(sales)
+    .where(buildSalesFilters(params))
+    .orderBy(desc(sales.soldAt))
+    .limit(params.limit)
+    .offset(params.offset);
+}
+
+export async function countSales(params: Omit<ListSalesParams, "limit" | "offset"> = {}): Promise<number> {
+  const [{ value }] = await db
+    .select({ value: count() })
+    .from(sales)
+    .where(buildSalesFilters(params));
+  return value;
+}
+
+export async function findSaleById(
+  id: string
+): Promise<(SaleRow & { items: (SaleItemRow & { productName: string; sku: string })[] }) | undefined> {
+  const [sale] = await db.select().from(sales).where(eq(sales.id, id)).limit(1);
+  if (!sale) return undefined;
+
+  const items = await db
+    .select()
+    .from(saleItems)
+    .where(eq(saleItems.saleId, id))
+    .orderBy(asc(saleItems.id));
+
+  const productIds = [...new Set(items.map((item) => item.productId))];
+  const productRows = productIds.length
+    ? await db
+        .select({ id: products.id, productName: products.productName, sku: products.sku })
+        .from(products)
+        .where(inArray(products.id, productIds))
+    : [];
+  const productById = new Map(productRows.map((p) => [p.id, p]));
+
+  const itemsWithProduct = items.map((item) => {
+    const product = productById.get(item.productId);
+    return {
+      ...item,
+      productName: product?.productName ?? "Unknown product",
+      sku: product?.sku ?? "—",
+    };
+  });
+
+  return { ...sale, items: itemsWithProduct };
+}
+```
+
+Note on `.for("update")` with a plain `db` select (not inside `db.transaction()`) in `findSaleForUpdate`/`findSaleItemsForUpdate`: these two functions are ONLY ever called with a `tx` handle from inside `sale.service.ts`'s `db.transaction()` callbacks (per their `tx: DbOrTx` parameter, no default) — never with the bare module `db` — so `.for("update")`'s row-lock semantics are always exercised within a real transaction, consistent with how `adjustInventory`/`completeSale` already call `.for("update")` only on their `tx` handles.
+
+Update `lib/repositories/user.repo.ts` to add:
+```ts
+export async function listUsersForFilter(): Promise<{ id: string; name: string }[]> {
+  return db.select({ id: users.id, name: users.name }).from(users).orderBy(users.name);
+}
+```
+(append this function to the existing file, below `findUserNamesByIds` — no changes to existing code needed.)
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `npx vitest run tests/integration/sale.repo.test.ts`
+Expected: PASS (all new tests green).
+
+- [ ] **Step 6: Update the two existing callers of `listSales`/`countSales` for the new signature**
+
+Search: `grep -rn "listSales\|countSales" app/ lib/ --include="*.ts" --include="*.tsx"` to confirm `app/(app)/sales/page.tsx` is the only caller (Task 6 will rewrite that file's call site properly as part of adding the filter bar — for THIS task, just confirm the old no-args `countSales()` call and `listSales({ limit, offset })` call in `app/(app)/sales/page.tsx` still type-check against the new signatures, since both new params are optional with `params.status` etc. all optional and `countSales`'s params object itself now defaults to `{}`). Run `npx tsc --noEmit` to confirm no type errors from this signature change before moving on — do not edit `app/(app)/sales/page.tsx`'s logic in this task, only verify it still compiles.
+
+Run: `npx tsc --noEmit`
+Expected: 0 errors.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add lib/repositories/sale.repo.ts lib/repositories/user.repo.ts tests/integration/sale.repo.test.ts
+git commit -m "Add locked sale/item fetch-update helpers and filtered listSales/countSales"
+```
+
+---
+
+### Task 4: Audit log repository
+
+**Files:**
+- Create: `lib/repositories/audit-log.repo.ts`
+- Test: `tests/integration/audit-log.repo.test.ts`
+
+**Interfaces:**
+- Consumes: `auditLogs` table from `lib/db/schema.ts`, `DbOrTx` type from `lib/repositories/inventory.repo.ts`.
+- Produces:
+  ```ts
+  export type AuditLogRow = typeof auditLogs.$inferSelect;
+  export type NewAuditLog = typeof auditLogs.$inferInsert;
+  export async function insertAuditLog(data: NewAuditLog, executor?: DbOrTx): Promise<AuditLogRow>;
+  ```
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/integration/audit-log.repo.test.ts` (mirror this repo's existing integration test setup style — check `tests/integration/sale.repo.test.ts` or `tests/integration/product.repo.test.ts` for the exact `describe`/DB-connection pattern used and match it, including any shared setup/teardown for test isolation):
+
+```ts
+import { describe, it, expect } from "vitest";
+import { insertAuditLog } from "@/lib/repositories/audit-log.repo";
+import { db } from "@/lib/db/client";
+import { users } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+
+describe("insertAuditLog", () => {
+  it("inserts a row with the given action, entity, and metadata", async () => {
+    const [user] = await db.select().from(users).limit(1); // reuse an existing seeded user, matching this repo's other integration tests' approach to fixtures
+    const row = await insertAuditLog({
+      userId: user.id,
+      action: "SALE_RETURNED",
+      entityType: "sale",
+      entityId: "00000000-0000-0000-0000-000000000001",
+      metadata: { items: [{ saleItemId: "item-1", quantity: 2 }], resultingStatus: "PARTIALLY_RETURNED" },
+    });
+
+    expect(row.id).toBeDefined();
+    expect(row.action).toBe("SALE_RETURNED");
+    expect(row.metadata).toEqual({ items: [{ saleItemId: "item-1", quantity: 2 }], resultingStatus: "PARTIALLY_RETURNED" });
+  });
+
+  it("participates in an outer transaction when passed a tx handle", async () => {
+    const [user] = await db.select().from(users).limit(1);
+    let insertedId: string | undefined;
+    await db.transaction(async (tx) => {
+      const row = await insertAuditLog(
+        { userId: user.id, action: "SALE_CANCELLED", entityType: "sale", entityId: "00000000-0000-0000-0000-000000000002", metadata: null },
+        tx
+      );
+      insertedId = row.id;
+      // Do not throw — let the transaction commit normally; this test only
+      // proves the tx handle is accepted and used, not rollback behavior
+      // (rollback behavior is covered by sale.service.test.ts's mocked tests).
+    });
+    expect(insertedId).toBeDefined();
+  });
+});
+```
+
+Adjust the fixture-lookup line (`db.select().from(users).limit(1)`) to match however other integration tests in this repo obtain a valid test user id — read `tests/integration/sale.repo.test.ts` or `tests/integration/inventory.service.test.ts` first and reuse the same helper/pattern rather than inventing a new one.
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run tests/integration/audit-log.repo.test.ts`
+Expected: FAIL — `lib/repositories/audit-log.repo.ts` doesn't exist yet.
+
+- [ ] **Step 3: Implement**
+
+Create `lib/repositories/audit-log.repo.ts`:
+
+```ts
+import { db } from "@/lib/db/client";
+import { auditLogs } from "@/lib/db/schema";
+import type { DbOrTx } from "./inventory.repo";
+
+export type AuditLogRow = typeof auditLogs.$inferSelect;
+export type NewAuditLog = typeof auditLogs.$inferInsert;
+
+export async function insertAuditLog(
+  data: NewAuditLog,
+  executor: DbOrTx = db
+): Promise<AuditLogRow> {
+  const [row] = await executor.insert(auditLogs).values(data).returning();
+  return row;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run tests/integration/audit-log.repo.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add lib/repositories/audit-log.repo.ts tests/integration/audit-log.repo.test.ts
+git commit -m "Add audit-log repository (first writer to audit_logs table)"
+```
+
+---
+
+### Task 5: Server Actions — `returnSaleItemsAction`, `cancelSaleAction`
+
+**Files:**
+- Create: `lib/validation/return.schema.ts`
+- Modify: `lib/actions/sale.actions.ts`
+- Test: `tests/unit/sale.actions.test.ts`
+
+**Interfaces:**
+- Consumes: `returnSaleItems`, `cancelSale`, `SaleNotFoundError`, `SaleNotCancellableError`, `InvalidReturnQuantityError` from `lib/services/sale.service.ts` (Task 2). `requireUser` from `lib/auth/guards.ts`.
+- Produces:
+  ```ts
+  export type ReturnSaleItemsResult = { ok: true } | { ok: false; error: string };
+  export async function returnSaleItemsAction(input: { saleId: string; items: { saleItemId: string; quantity: number }[] }): Promise<ReturnSaleItemsResult>;
+
+  export type CancelSaleResult = { ok: true } | { ok: false; error: string };
+  export async function cancelSaleAction(input: { saleId: string }): Promise<CancelSaleResult>;
+  ```
+
+- [ ] **Step 1: Write the validation schema**
+
+Create `lib/validation/return.schema.ts`:
+
+```ts
+import { z } from "zod";
+
+export const returnLineSchema = z.object({
+  saleItemId: z.string().uuid(),
+  quantity: z.number().int().positive("Quantity must be at least 1"),
+});
+
+export const returnSaleItemsSchema = z.object({
+  saleId: z.string().uuid(),
+  items: z.array(returnLineSchema).min(1, "Select at least one item to return"),
+});
+
+export const cancelSaleSchema = z.object({
+  saleId: z.string().uuid(),
+});
+
+export type ReturnLineInput = z.infer<typeof returnLineSchema>;
+export type ReturnSaleItemsInput = z.infer<typeof returnSaleItemsSchema>;
+export type CancelSaleInput = z.infer<typeof cancelSaleSchema>;
+```
+
+- [ ] **Step 2: Write failing tests for the two actions**
+
+Add to `tests/unit/sale.actions.test.ts` (this file already mocks `@/lib/services/sale.service` and `@/lib/auth/guards` for `completeSaleAction`'s tests — extend those same `vi.mock` blocks; read the existing mock setup first):
+
+```ts
+describe("returnSaleItemsAction", () => {
+  it("returns ok:true on success", async () => {
+    vi.mocked(returnSaleItems).mockResolvedValue({ id: "sale-1" } as never);
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-1111-1111-111111111111", items: [{ saleItemId: "22222222-2222-2222-2222-222222222222", quantity: 1 }] });
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("returns ok:false with a validation message for malformed input", async () => {
+    const result = await returnSaleItemsAction({ saleId: "not-a-uuid", items: [] });
+    expect(result.ok).toBe(false);
+  });
+
+  it("maps InvalidReturnQuantityError to ok:false", async () => {
+    vi.mocked(returnSaleItems).mockRejectedValue(new InvalidReturnQuantityError("item-1", 5, 2));
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-1111-1111-111111111111", items: [{ saleItemId: "22222222-2222-2222-2222-222222222222", quantity: 5 }] });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("maps SaleNotFoundError to ok:false", async () => {
+    vi.mocked(returnSaleItems).mockRejectedValue(new SaleNotFoundError("sale-1"));
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-1111-1111-111111111111", items: [{ saleItemId: "22222222-2222-2222-2222-222222222222", quantity: 1 }] });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("does not throw for an unmapped SaleNotCancellableError-style rejection on return (defensive)", async () => {
+    vi.mocked(returnSaleItems).mockRejectedValue(new SaleNotCancellableError("sale-1", "CANCELLED"));
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-1111-1111-111111111111", items: [{ saleItemId: "22222222-2222-2222-2222-222222222222", quantity: 1 }] });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("calls requireUser before performing the return", async () => {
+    await returnSaleItemsAction({ saleId: "11111111-1111-1111-1111-111111111111", items: [{ saleItemId: "22222222-2222-2222-2222-222222222222", quantity: 1 }] });
+    expect(requireUser).toHaveBeenCalled();
+  });
+});
+
+describe("cancelSaleAction", () => {
+  it("returns ok:true on success", async () => {
+    vi.mocked(cancelSale).mockResolvedValue({ id: "sale-1" } as never);
+    const result = await cancelSaleAction({ saleId: "11111111-1111-1111-1111-111111111111" });
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("maps SaleNotCancellableError to ok:false", async () => {
+    vi.mocked(cancelSale).mockRejectedValue(new SaleNotCancellableError("sale-1", "PARTIALLY_RETURNED"));
+    const result = await cancelSaleAction({ saleId: "11111111-1111-1111-1111-111111111111" });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("maps SaleNotFoundError to ok:false", async () => {
+    vi.mocked(cancelSale).mockRejectedValue(new SaleNotFoundError("sale-1"));
+    const result = await cancelSaleAction({ saleId: "11111111-1111-1111-1111-111111111111" });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("returns ok:false for malformed input", async () => {
+    const result = await cancelSaleAction({ saleId: "not-a-uuid" });
+    expect(result.ok).toBe(false);
+  });
+});
+```
+
+Add imports (extend the existing import block):
+```ts
+import { returnSaleItemsAction, cancelSaleAction } from "@/lib/actions/sale.actions";
+import {
+  returnSaleItems,
+  cancelSale,
+  SaleNotFoundError,
+  SaleNotCancellableError,
+  InvalidReturnQuantityError,
+} from "@/lib/services/sale.service";
+```
+and extend the file's existing `vi.mock("@/lib/services/sale.service", ...)` factory to also export `returnSaleItems: vi.fn()`, `cancelSale: vi.fn()`, plus the three error classes (mock them as real `class X extends Error {}` re-exports, not `vi.fn()`, matching how the file's existing `vi.mock` for `ProductNotFoundError`/`InsufficientInventoryError` already does it — read the existing mock block for the exact style before writing this).
+
+- [ ] **Step 3: Run tests to verify they fail**
+
+Run: `npx vitest run tests/unit/sale.actions.test.ts`
+Expected: FAIL — `returnSaleItemsAction`/`cancelSaleAction` not exported yet.
+
+- [ ] **Step 4: Implement the actions**
+
+Add to `lib/actions/sale.actions.ts` (extend the existing imports at the top, then append below `completeSaleAction`):
+
+```ts
+import {
+  returnSaleItems,
+  cancelSale,
+  SaleNotFoundError,
+  SaleNotCancellableError,
+  InvalidReturnQuantityError,
+} from "@/lib/services/sale.service";
+import { returnSaleItemsSchema, cancelSaleSchema } from "@/lib/validation/return.schema";
+
+export type ReturnSaleItemsResult = { ok: true } | { ok: false; error: string };
+
+export async function returnSaleItemsAction(input: {
+  saleId: string;
+  items: { saleItemId: string; quantity: number }[];
+}): Promise<ReturnSaleItemsResult> {
+  const user = await requireUser();
+
+  const parsed = returnSaleItemsSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid return data" };
+  }
+
+  try {
+    await returnSaleItems({ saleId: parsed.data.saleId, userId: user.id, items: parsed.data.items });
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof InvalidReturnQuantityError) return { ok: false, error: error.message };
+    if (error instanceof SaleNotFoundError) return { ok: false, error: error.message };
+    if (error instanceof SaleNotCancellableError) return { ok: false, error: error.message };
+    throw error;
+  }
+}
+
+export type CancelSaleResult = { ok: true } | { ok: false; error: string };
+
+export async function cancelSaleAction(input: { saleId: string }): Promise<CancelSaleResult> {
+  const user = await requireUser();
+
+  const parsed = cancelSaleSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid request" };
+  }
+
+  try {
+    await cancelSale({ saleId: parsed.data.saleId, userId: user.id });
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof SaleNotFoundError) return { ok: false, error: error.message };
+    if (error instanceof SaleNotCancellableError) return { ok: false, error: error.message };
+    throw error;
+  }
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `npx vitest run tests/unit/sale.actions.test.ts`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add lib/validation/return.schema.ts lib/actions/sale.actions.ts tests/unit/sale.actions.test.ts
+git commit -m "Add returnSaleItemsAction and cancelSaleAction"
+```
+
+---
+
+### Task 6: `/sales/[id]` UI — Cancel button, Return dialog, derived totals
+
+**Files:**
+- Create: `components/ui/dialog.tsx` (via shadcn CLI)
+- Create: `components/sales/CancelSaleButton.tsx`
+- Create: `components/sales/ReturnItemsDialog.tsx`
+- Modify: `app/(app)/sales/[id]/page.tsx`
+- Test: `tests/unit/CancelSaleButton.test.tsx`, `tests/unit/ReturnItemsDialog.test.tsx`
+
+**Interfaces:**
+- Consumes: `returnSaleItemsAction`, `cancelSaleAction` from `lib/actions/sale.actions.ts` (Task 5). `findSaleById`'s return shape from `lib/repositories/sale.repo.ts` (now includes `returnedQuantity` per item, per Task 1/3).
+- Produces: `<CancelSaleButton saleId={string} />`, `<ReturnItemsDialog saleId={string} items={{id: string; productName: string; sku: string; quantity: number; returnedQuantity: number}[]} />` — both client components, both call their action and `router.refresh()` (or navigate) on success.
+
+- [ ] **Step 1: Add the shadcn dialog component**
+
+Run: `npx shadcn add dialog`
+Expected: creates `components/ui/dialog.tsx`. Per this project's established gotchas (documented in project memory): check `package.json` afterward for a stray `"cn":` dependency the shadcn CLI sometimes adds even though nothing imports it — if present, remove it (`npm uninstall cn`). Also check the generated file for any `asChild` prop usage — this project's base-ui-based shadcn setup uses `render={<Component/>}` instead (see `components/ui/button.tsx` for the established conversion pattern) — convert any `asChild` usage found to the `render` prop pattern before proceeding.
+
+Run: `grep -n '"cn"' package.json` — expected: no output (not present). If present, run `npm uninstall cn`.
+
+- [ ] **Step 2: Write the failing test for `CancelSaleButton`**
+
+Create `tests/unit/CancelSaleButton.test.tsx` (match this repo's existing component test conventions — check `tests/unit/SellCart.test.tsx` for the `// @vitest-environment jsdom` pragma, explicit `afterEach(cleanup)`, and mocking style used, since this repo runs `globals: false`):
+
+```tsx
+// @vitest-environment jsdom
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { CancelSaleButton } from "@/components/sales/CancelSaleButton";
+import { cancelSaleAction } from "@/lib/actions/sale.actions";
+
+vi.mock("@/lib/actions/sale.actions", () => ({
+  cancelSaleAction: vi.fn(),
+}));
+
+const mockRefresh = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ refresh: mockRefresh }),
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe("CancelSaleButton", () => {
+  it("shows a confirm step before calling the action", () => {
+    render(<CancelSaleButton saleId="sale-1" />);
+    fireEvent.click(screen.getByRole("button", { name: /cancel sale/i }));
+    expect(cancelSaleAction).not.toHaveBeenCalled();
+    expect(screen.getByText(/are you sure/i)).toBeInTheDocument();
+  });
+
+  it("calls cancelSaleAction with the sale id on confirm and refreshes on success", async () => {
+    vi.mocked(cancelSaleAction).mockResolvedValue({ ok: true });
+    render(<CancelSaleButton saleId="sale-1" />);
+    fireEvent.click(screen.getByRole("button", { name: /cancel sale/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+    await waitFor(() => expect(cancelSaleAction).toHaveBeenCalledWith({ saleId: "sale-1" }));
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalled());
+  });
+
+  it("shows the error message on failure without refreshing", async () => {
+    vi.mocked(cancelSaleAction).mockResolvedValue({ ok: false, error: "Sale cannot be cancelled" });
+    render(<CancelSaleButton saleId="sale-1" />);
+    fireEvent.click(screen.getByRole("button", { name: /cancel sale/i }));
+    fireEvent.click(screen.getByRole("button", { name: /confirm/i }));
+    await waitFor(() => expect(screen.getByText("Sale cannot be cancelled")).toBeInTheDocument());
+    expect(mockRefresh).not.toHaveBeenCalled();
+  });
+});
+```
+
+- [ ] **Step 3: Run test to verify it fails**
+
+Run: `npx vitest run tests/unit/CancelSaleButton.test.tsx`
+Expected: FAIL — component doesn't exist.
+
+- [ ] **Step 4: Implement `CancelSaleButton`**
+
+Create `components/sales/CancelSaleButton.tsx`:
+
+```tsx
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { cancelSaleAction } from "@/lib/actions/sale.actions";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+
+export function CancelSaleButton({ saleId }: { saleId: string }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+
+  function handleConfirm() {
+    setError(null);
+    startTransition(async () => {
+      const result = await cancelSaleAction({ saleId });
+      if (result.ok) {
+        setOpen(false);
+        router.refresh();
+      } else {
+        setError(result.error);
+      }
+    });
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger render={<Button variant="destructive">Cancel Sale</Button>} />
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Cancel this sale?</DialogTitle>
+        </DialogHeader>
+        <p className="text-sm text-muted-foreground">
+          Are you sure? This restores all items to inventory and cannot be undone.
+        </p>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setOpen(false)} disabled={isPending}>
+            Back
+          </Button>
+          <Button variant="destructive" onClick={handleConfirm} disabled={isPending}>
+            Confirm
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+```
+
+Note: the exact export names from `components/ui/dialog.tsx` (`Dialog`, `DialogContent`, `DialogHeader`, `DialogTitle`, `DialogFooter`, `DialogTrigger`) depend on what the shadcn CLI generates in Step 1 — read that generated file before writing this component and adjust names/props (especially `DialogTrigger`'s render pattern — likely `render={<Button>...</Button>}` matching `SelectTrigger`'s established pattern in this codebase, not `asChild`) to match exactly what was generated, the same way `CancelSaleButton`'s own `<Button>` usage above must match `components/ui/button.tsx`'s real prop signature.
+
+- [ ] **Step 5: Run test to verify it passes**
+
+Run: `npx vitest run tests/unit/CancelSaleButton.test.tsx`
+Expected: PASS.
+
+- [ ] **Step 6: Write the failing test for `ReturnItemsDialog`**
+
+Create `tests/unit/ReturnItemsDialog.test.tsx`:
+
+```tsx
+// @vitest-environment jsdom
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, screen, cleanup, fireEvent, waitFor } from "@testing-library/react";
+import { ReturnItemsDialog } from "@/components/sales/ReturnItemsDialog";
+import { returnSaleItemsAction } from "@/lib/actions/sale.actions";
+
+vi.mock("@/lib/actions/sale.actions", () => ({
+  returnSaleItemsAction: vi.fn(),
+}));
+
+const mockRefresh = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ refresh: mockRefresh }),
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+const items = [
+  { id: "item-1", productName: "Widget A", sku: "WID-A", quantity: 5, returnedQuantity: 0 },
+  { id: "item-2", productName: "Widget B", sku: "WID-B", quantity: 3, returnedQuantity: 1 },
+];
+
+describe("ReturnItemsDialog", () => {
+  it("shows each line's sold quantity and remaining-returnable amount", () => {
+    render(<ReturnItemsDialog saleId="sale-1" items={items} />);
+    fireEvent.click(screen.getByRole("button", { name: /return items/i }));
+    expect(screen.getByText("Widget A")).toBeInTheDocument();
+    expect(screen.getByText(/remaining: 2/i)).toBeInTheDocument(); // item-2: 3 - 1
+  });
+
+  it("disables Confirm when no line has a non-zero quantity entered", () => {
+    render(<ReturnItemsDialog saleId="sale-1" items={items} />);
+    fireEvent.click(screen.getByRole("button", { name: /return items/i }));
+    expect(screen.getByRole("button", { name: /confirm return/i })).toBeDisabled();
+  });
+
+  it("submits only the non-zero lines to returnSaleItemsAction", async () => {
+    vi.mocked(returnSaleItemsAction).mockResolvedValue({ ok: true });
+    render(<ReturnItemsDialog saleId="sale-1" items={items} />);
+    fireEvent.click(screen.getByRole("button", { name: /return items/i }));
+
+    const qtyInputs = screen.getAllByRole("spinbutton");
+    fireEvent.change(qtyInputs[0], { target: { value: "2" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /confirm return/i }));
+
+    await waitFor(() =>
+      expect(returnSaleItemsAction).toHaveBeenCalledWith({
+        saleId: "sale-1",
+        items: [{ saleItemId: "item-1", quantity: 2 }],
+      })
+    );
+    await waitFor(() => expect(mockRefresh).toHaveBeenCalled());
+  });
+
+  it("does not allow a quantity input above the remaining amount", () => {
+    render(<ReturnItemsDialog saleId="sale-1" items={items} />);
+    fireEvent.click(screen.getByRole("button", { name: /return items/i }));
+    const qtyInputs = screen.getAllByRole("spinbutton");
+    expect(qtyInputs[1]).toHaveAttribute("max", "2"); // item-2's remaining
+  });
+});
+```
+
+- [ ] **Step 7: Run test to verify it fails**
+
+Run: `npx vitest run tests/unit/ReturnItemsDialog.test.tsx`
+Expected: FAIL — component doesn't exist.
+
+- [ ] **Step 8: Implement `ReturnItemsDialog`**
+
+Create `components/sales/ReturnItemsDialog.tsx`:
+
+```tsx
+"use client";
+
+import { useMemo, useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { returnSaleItemsAction } from "@/lib/actions/sale.actions";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogFooter,
+  DialogTrigger,
+} from "@/components/ui/dialog";
+
+type ReturnableItem = {
+  id: string;
+  productName: string;
+  sku: string;
+  quantity: number;
+  returnedQuantity: number;
+};
+
+export function ReturnItemsDialog({ saleId, items }: { saleId: string; items: ReturnableItem[] }) {
+  const router = useRouter();
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isPending, startTransition] = useTransition();
+  const [quantities, setQuantities] = useState<Record<string, number>>({});
+
+  const hasAnyQuantity = useMemo(
+    () => Object.values(quantities).some((qty) => qty > 0),
+    [quantities]
+  );
+
+  function handleConfirm() {
+    setError(null);
+    const payload = items
+      .map((item) => ({ saleItemId: item.id, quantity: quantities[item.id] ?? 0 }))
+      .filter((line) => line.quantity > 0);
+
+    startTransition(async () => {
+      const result = await returnSaleItemsAction({ saleId, items: payload });
+      if (result.ok) {
+        setOpen(false);
+        setQuantities({});
+        router.refresh();
+      } else {
+        setError(result.error);
+      }
+    });
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger render={<Button variant="outline">Return Items</Button>} />
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Return items from this sale</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-3">
+          {items.map((item) => {
+            const remaining = item.quantity - item.returnedQuantity;
+            return (
+              <div key={item.id} className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium">{item.productName}</p>
+                  <p className="text-xs text-muted-foreground">
+                    Sold: {item.quantity} · Remaining: {remaining}
+                  </p>
+                </div>
+                <div className="w-24">
+                  <Label htmlFor={`return-qty-${item.id}`} className="sr-only">
+                    Quantity to return for {item.productName}
+                  </Label>
+                  <Input
+                    id={`return-qty-${item.id}`}
+                    type="number"
+                    min={0}
+                    max={remaining}
+                    disabled={remaining === 0}
+                    value={quantities[item.id] ?? 0}
+                    onChange={(e) => {
+                      const raw = Number(e.target.value);
+                      const clamped = Number.isFinite(raw) ? Math.max(0, Math.min(remaining, raw)) : 0;
+                      setQuantities((prev) => ({ ...prev, [item.id]: clamped }));
+                    }}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {error && <p className="text-sm text-destructive">{error}</p>}
+        <DialogFooter>
+          <Button variant="outline" onClick={() => setOpen(false)} disabled={isPending}>
+            Cancel
+          </Button>
+          <Button onClick={handleConfirm} disabled={isPending || !hasAnyQuantity}>
+            Confirm Return
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+```
+
+As with Task 6 Step 4, adjust the `Dialog*` import names/props to match whatever Step 1's `npx shadcn add dialog` actually generated.
+
+- [ ] **Step 9: Run test to verify it passes**
+
+Run: `npx vitest run tests/unit/ReturnItemsDialog.test.tsx`
+Expected: PASS.
+
+- [ ] **Step 10: Wire both components into `/sales/[id]`, add derived returned/net display and extended status badge**
+
+Modify `app/(app)/sales/[id]/page.tsx`:
+
+```tsx
+import { notFound } from "next/navigation";
+import Link from "next/link";
+import { requireUser } from "@/lib/auth/guards";
+import { findSaleById } from "@/lib/repositories/sale.repo";
+import { findUserNamesByIds } from "@/lib/repositories/user.repo";
+import { Badge } from "@/components/ui/badge";
+import { CancelSaleButton } from "@/components/sales/CancelSaleButton";
+import { ReturnItemsDialog } from "@/components/sales/ReturnItemsDialog";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+
+export default async function SaleDetailPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  await requireUser();
+  const { id } = await params;
+
+  const sale = await findSaleById(id);
+  if (!sale) notFound();
+
+  const userNameById = await findUserNamesByIds([sale.soldBy]);
+
+  const returnedAmount = sale.items.reduce(
+    (sum, item) => sum + item.returnedQuantity * Number(item.soldPricePerUnit),
+    0
+  );
+  const hasAnyReturn = sale.items.some((item) => item.returnedQuantity > 0);
+  const netAmount = Number(sale.totalAmount) - returnedAmount;
+
+  return (
+    <div className="p-4 space-y-6">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold">{sale.saleNumber}</h1>
+          <p className="text-muted-foreground">
+            {sale.soldAt.toLocaleString()} · Sold by {userNameById.get(sale.soldBy) ?? "Unknown"}
+          </p>
+          <Badge variant="secondary" className="mt-2">
+            {sale.status}
+          </Badge>
+        </div>
+        <div className="flex gap-2">
+          {sale.status === "COMPLETED" && <CancelSaleButton saleId={sale.id} />}
+          {(sale.status === "COMPLETED" || sale.status === "PARTIALLY_RETURNED") && (
+            <ReturnItemsDialog
+              saleId={sale.id}
+              items={sale.items.map((item) => ({
+                id: item.id,
+                productName: item.productName,
+                sku: item.sku,
+                quantity: item.quantity,
+                returnedQuantity: item.returnedQuantity,
+              }))}
+            />
+          )}
+        </div>
+      </div>
+
+      {(sale.buyerName || sale.buyerPhone) && (
+        <div className="text-sm">
+          <p className="font-medium">Buyer</p>
+          {sale.buyerName && <p>{sale.buyerName}</p>}
+          {sale.buyerPhone && <p className="text-muted-foreground">{sale.buyerPhone}</p>}
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-md border">
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>Product</TableHead>
+              <TableHead>Qty</TableHead>
+              <TableHead>Returned</TableHead>
+              <TableHead>Sold Price</TableHead>
+              <TableHead>Cost</TableHead>
+              <TableHead>Revenue</TableHead>
+              <TableHead>Profit</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {sale.items.map((item) => (
+              <TableRow key={item.id}>
+                <TableCell>
+                  <Link
+                    href={`/products/${item.productId}`}
+                    className="font-medium underline-offset-4 hover:underline"
+                  >
+                    {item.productName}
+                  </Link>
+                  <p className="text-xs text-muted-foreground">{item.sku}</p>
+                </TableCell>
+                <TableCell>{item.quantity}</TableCell>
+                <TableCell>{item.returnedQuantity > 0 ? item.returnedQuantity : "—"}</TableCell>
+                <TableCell>${item.soldPricePerUnit}</TableCell>
+                <TableCell>${item.costPerUnit}</TableCell>
+                <TableCell>${item.totalRevenue}</TableCell>
+                <TableCell>${item.profit}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
+
+      <div className="flex flex-col items-end gap-1 text-sm">
+        <div className="flex gap-6 font-medium">
+          <span>Total cost: ${sale.totalCost}</span>
+          <span>Total revenue: ${sale.totalAmount}</span>
+          <span>Total profit: ${sale.totalProfit}</span>
+        </div>
+        {hasAnyReturn && (
+          <div className="flex gap-6 text-muted-foreground">
+            <span>Returned: -${returnedAmount.toFixed(2)}</span>
+            <span className="font-medium text-foreground">Net: ${netAmount.toFixed(2)}</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 11: Manually verify types and run the full test suite for this task's files**
+
+Run: `npx tsc --noEmit`
+Expected: 0 errors.
+
+Run: `npx vitest run tests/unit/CancelSaleButton.test.tsx tests/unit/ReturnItemsDialog.test.tsx`
+Expected: PASS.
+
+- [ ] **Step 12: Commit**
+
+```bash
+git add components/ui/dialog.tsx components/sales/CancelSaleButton.tsx components/sales/ReturnItemsDialog.tsx "app/(app)/sales/[id]/page.tsx" tests/unit/CancelSaleButton.test.tsx tests/unit/ReturnItemsDialog.test.tsx package.json package-lock.json
+git commit -m "Add cancel/return UI to /sales/[id]: buttons, dialog, derived returned/net totals"
+```
+
+---
+
+### Task 7: `/sales` list UI — filter bar
+
+**Files:**
+- Create: `components/sales/SalesFilterBar.tsx`
+- Modify: `app/(app)/sales/page.tsx`
+- Test: `tests/unit/SalesFilterBar.test.tsx`
+
+**Interfaces:**
+- Consumes: `listSales`, `countSales` (Task 3's extended signatures), `listUsersForFilter` (Task 3) from repos; `listProducts` (existing, from `lib/repositories/product.repo.ts`).
+- Produces: `<SalesFilterBar products={{id: string; productName: string}[]} users={{id: string; name: string}[]} />` — client component rendering a `<form>` that navigates via `router.push` with updated URL search params on submit/change.
+
+- [ ] **Step 1: Write the failing test for `SalesFilterBar`**
+
+Create `tests/unit/SalesFilterBar.test.tsx`:
+
+```tsx
+// @vitest-environment jsdom
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { render, screen, cleanup, fireEvent } from "@testing-library/react";
+import { SalesFilterBar } from "@/components/sales/SalesFilterBar";
+
+const mockPush = vi.fn();
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({ push: mockPush }),
+  useSearchParams: () => new URLSearchParams(),
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+const products = [{ id: "prod-1", productName: "Widget A" }];
+const users = [{ id: "user-1", name: "Alice" }];
+
+describe("SalesFilterBar", () => {
+  it("renders a text input, status select, product select, and user select", () => {
+    render(<SalesFilterBar products={products} users={users} />);
+    expect(screen.getByPlaceholderText(/sale number or sku/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/status/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/product/i)).toBeInTheDocument();
+    expect(screen.getByLabelText(/user/i)).toBeInTheDocument();
+  });
+
+  it("navigates with the query param on text submit, resetting page to 1", () => {
+    render(<SalesFilterBar products={products} users={users} />);
+    fireEvent.change(screen.getByPlaceholderText(/sale number or sku/i), { target: { value: "SALE-000001" } });
+    fireEvent.submit(screen.getByRole("search"));
+    expect(mockPush).toHaveBeenCalledWith(expect.stringContaining("q=SALE-000001"));
+    expect(mockPush).toHaveBeenCalledWith(expect.stringContaining("page=1"));
+  });
+
+  it("navigates with the status param when a status is selected", () => {
+    render(<SalesFilterBar products={products} users={users} />);
+    fireEvent.change(screen.getByLabelText(/status/i), { target: { value: "CANCELLED" } });
+    expect(mockPush).toHaveBeenCalledWith(expect.stringContaining("status=CANCELLED"));
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `npx vitest run tests/unit/SalesFilterBar.test.tsx`
+Expected: FAIL — component doesn't exist.
+
+- [ ] **Step 3: Implement `SalesFilterBar`**
+
+Create `components/sales/SalesFilterBar.tsx`:
+
+```tsx
+"use client";
+
+import { useRouter, useSearchParams } from "next/navigation";
+import { useState } from "react";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Button } from "@/components/ui/button";
+
+const STATUSES = ["COMPLETED", "CANCELLED", "PARTIALLY_RETURNED", "RETURNED"] as const;
+
+export function SalesFilterBar({
+  products,
+  users,
+}: {
+  products: { id: string; productName: string }[];
+  users: { id: string; name: string }[];
+}) {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const [query, setQuery] = useState(searchParams.get("q") ?? "");
+
+  function navigate(nextParams: Record<string, string | undefined>) {
+    const params = new URLSearchParams(searchParams.toString());
+    for (const [key, value] of Object.entries(nextParams)) {
+      if (value) {
+        params.set(key, value);
+      } else {
+        params.delete(key);
+      }
+    }
+    params.set("page", "1");
+    router.push(`/sales?${params.toString()}`);
+  }
+
+  return (
+    <div className="space-y-3">
+      <form
+        role="search"
+        className="flex gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          navigate({ q: query || undefined });
+        }}
+      >
+        <Input
+          placeholder="Sale number or SKU"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        <Button type="submit">Search</Button>
+      </form>
+
+      <div className="flex flex-wrap gap-3">
+        <div>
+          <Label htmlFor="filter-status">Status</Label>
+          <select
+            id="filter-status"
+            className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
+            value={searchParams.get("status") ?? ""}
+            onChange={(e) => navigate({ status: e.target.value || undefined })}
+          >
+            <option value="">All</option>
+            {STATUSES.map((status) => (
+              <option key={status} value={status}>
+                {status}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <Label htmlFor="filter-product">Product</Label>
+          <select
+            id="filter-product"
+            className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
+            value={searchParams.get("productId") ?? ""}
+            onChange={(e) => navigate({ productId: e.target.value || undefined })}
+          >
+            <option value="">All</option>
+            {products.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.productName}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <Label htmlFor="filter-user">User</Label>
+          <select
+            id="filter-user"
+            className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
+            value={searchParams.get("userId") ?? ""}
+            onChange={(e) => navigate({ userId: e.target.value || undefined })}
+          >
+            <option value="">All</option>
+            {users.map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <div>
+          <Label htmlFor="filter-date-from">From</Label>
+          <input
+            id="filter-date-from"
+            type="date"
+            className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
+            defaultValue={searchParams.get("dateFrom") ?? ""}
+            onChange={(e) => navigate({ dateFrom: e.target.value || undefined })}
+          />
+        </div>
+
+        <div>
+          <Label htmlFor="filter-date-to">To</Label>
+          <input
+            id="filter-date-to"
+            type="date"
+            className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
+            defaultValue={searchParams.get("dateTo") ?? ""}
+            onChange={(e) => navigate({ dateTo: e.target.value || undefined })}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+Note: plain native `<select>`/`<input type="date">` elements are used here deliberately rather than the `components/ui/select.tsx` base-ui popup — this filter bar is a URL-navigable GET form, and native form elements keep `onChange` semantics simple and don't require the extra client-state wiring base-ui's custom `Select` needs for a value that must stay in sync with the URL. This matches the project's YAGNI-first precedent (e.g. `/products` search uses a plain `Input`, not a custom combobox).
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `npx vitest run tests/unit/SalesFilterBar.test.tsx`
+Expected: PASS.
+
+- [ ] **Step 5: Wire the filter bar into `/sales`, extend `listSales`/`countSales` call site**
+
+Modify `app/(app)/sales/page.tsx`:
+
+```tsx
+import Link from "next/link";
+import { requireUser } from "@/lib/auth/guards";
+import { listSales, countSales } from "@/lib/repositories/sale.repo";
+import { findUserNamesByIds, listUsersForFilter } from "@/lib/repositories/user.repo";
+import { listProducts } from "@/lib/repositories/product.repo";
+import { SalesFilterBar } from "@/components/sales/SalesFilterBar";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+
+const PAGE_SIZE = 25;
+
+type SalesSearchParams = {
+  page?: string;
+  q?: string;
+  status?: "COMPLETED" | "CANCELLED" | "PARTIALLY_RETURNED" | "RETURNED";
+  productId?: string;
+  userId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+};
+
+export default async function SalesPage({
+  searchParams,
+}: {
+  searchParams: Promise<SalesSearchParams>;
+}) {
+  await requireUser();
+  const sp = await searchParams;
+
+  const page = Math.max(1, Number(sp.page) || 1);
+  const offset = (page - 1) * PAGE_SIZE;
+
+  const filterParams = {
+    query: sp.q,
+    status: sp.status,
+    productId: sp.productId,
+    userId: sp.userId,
+    dateFrom: sp.dateFrom ? new Date(sp.dateFrom) : undefined,
+    dateTo: sp.dateTo ? new Date(sp.dateTo) : undefined,
+  };
+
+  const [salesList, total, products, users] = await Promise.all([
+    listSales({ limit: PAGE_SIZE, offset, ...filterParams }),
+    countSales(filterParams),
+    listProducts({ limit: 500, offset: 0 }),
+    listUsersForFilter(),
+  ]);
+
+  const userIds = [...new Set(salesList.map((s) => s.soldBy))];
+  const userNameById = await findUserNamesByIds(userIds);
+
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+
+  const hasActiveFilters = Boolean(sp.q || sp.status || sp.productId || sp.userId || sp.dateFrom || sp.dateTo);
+
+  function pageHref(targetPage: number): string {
+    const params = new URLSearchParams();
+    if (sp.q) params.set("q", sp.q);
+    if (sp.status) params.set("status", sp.status);
+    if (sp.productId) params.set("productId", sp.productId);
+    if (sp.userId) params.set("userId", sp.userId);
+    if (sp.dateFrom) params.set("dateFrom", sp.dateFrom);
+    if (sp.dateTo) params.set("dateTo", sp.dateTo);
+    params.set("page", String(targetPage));
+    return `/sales?${params.toString()}`;
+  }
+
+  return (
+    <div className="p-4 space-y-4">
+      <h1 className="text-2xl font-semibold">Sales</h1>
+
+      <SalesFilterBar
+        products={products.map((p) => ({ id: p.id, productName: p.productName }))}
+        users={users}
+      />
+
+      {salesList.length === 0 ? (
+        <p className="text-muted-foreground">
+          {hasActiveFilters ? "No sales match these filters." : "No sales yet."}
+        </p>
+      ) : (
+        <div className="overflow-x-auto rounded-md border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Sale #</TableHead>
+                <TableHead>Date</TableHead>
+                <TableHead>Buyer</TableHead>
+                <TableHead>Total</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Sold By</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {salesList.map((sale) => (
+                <TableRow key={sale.id}>
+                  <TableCell>
+                    <Link href={`/sales/${sale.id}`} className="underline">
+                      {sale.saleNumber}
+                    </Link>
+                  </TableCell>
+                  <TableCell>{sale.soldAt.toLocaleString()}</TableCell>
+                  <TableCell>{sale.buyerName ?? "—"}</TableCell>
+                  <TableCell>${sale.totalAmount}</TableCell>
+                  <TableCell>
+                    <Badge variant="secondary">{sale.status}</Badge>
+                  </TableCell>
+                  <TableCell>{userNameById.get(sale.soldBy) ?? "Unknown"}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+
+      {totalPages > 1 && (
+        <div className="flex items-center justify-between text-sm text-muted-foreground">
+          <span>
+            Page {page} of {totalPages} ({total} sales)
+          </span>
+          <div className="flex gap-2">
+            {page > 1 && (
+              <Button variant="outline" size="sm" render={<Link href={pageHref(page - 1)}>Previous</Link>} />
+            )}
+            {page < totalPages && (
+              <Button variant="outline" size="sm" render={<Link href={pageHref(page + 1)}>Next</Link>} />
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Run full type check and this task's tests**
+
+Run: `npx tsc --noEmit`
+Expected: 0 errors.
+
+Run: `npx vitest run tests/unit/SalesFilterBar.test.tsx`
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add components/sales/SalesFilterBar.tsx "app/(app)/sales/page.tsx" tests/unit/SalesFilterBar.test.tsx
+git commit -m "Add filter bar to /sales: search, status, product, user, date range"
+```
+
+---
+
+### Task 8: Final whole-branch review pass
+
+This task has no new code of its own — it verifies the previous 7 tasks integrate correctly, the way Phase 6's final whole-branch review caught 3 cross-task issues no single task's review could see.
+
+**Files:** none created; this task only runs verification commands and, if issues are found, produces a follow-up fix commit.
+
+- [ ] **Step 1: Run the full test suite**
+
+Run: `npx vitest run`
+Expected: all tests pass, including every test added in Tasks 1-7 alongside all pre-existing tests. If the OneDrive-related vitest `@/`-alias resolution failure (documented in project memory) recurs, fall back to `npx tsc --noEmit` + `npm run build` and disclose this substitution explicitly rather than silently treating it as equivalent coverage — per established project preference, ask the user before proceeding on the weaker check.
+
+- [ ] **Step 2: Run the full production build**
+
+Run: `npm run build`
+Expected: clean build, all routes (including `/sales`, `/sales/[id]`) registered with no errors.
+
+- [ ] **Step 3: Run the type checker**
+
+Run: `npx tsc --noEmit`
+Expected: 0 errors.
+
+- [ ] **Step 4: Cross-task integration check — trace one full cancel flow and one full partial-return flow by reading code, not just running tests**
+
+Manually trace (read the actual committed code, don't assume): `CancelSaleButton` → `cancelSaleAction` → `cancelSale` → `applyReturn` → `updateSaleItemReturnedQuantity` + `insertInventoryTransaction` + `updateSaleStatus` + `insertAuditLog`, confirming every write in that chain passes the SAME `tx` handle (no step silently uses the bare `db` import instead of `tx`, which would break atomicity — this exact class of bug is called out by name in `inventory.repo.ts`'s `DbOrTx` doc comment). Do the same trace for `ReturnItemsDialog` → `returnSaleItemsAction` → `returnSaleItems`.
+
+- [ ] **Step 5: If any issue is found in Steps 1-4, fix it directly and re-run Steps 1-3**
+
+No placeholder — if a real defect is found, write the fix, verify with the same commands, then commit with a message describing exactly what cross-task integration issue it fixes (matching Phase 6's precedent of documenting the specific found-and-fixed issue in the commit message, not a generic "fix bugs").
+
+- [ ] **Step 6: Final commit (only if Step 5 produced changes; otherwise skip)**
+
+```bash
+git add -A
+git commit -m "Fix cross-task integration issue found in Phase 7 final review: <specific description>"
+```
+
+---
+
+## Post-Plan Note
+
+Task 12-equivalent manual real-device/browser verification (confirming the Cancel/Return UI actually works end-to-end against the real dev DB, not just unit/integration tests) is the user's own step, same as Phase 6's Task 12 — call this out explicitly when the branch is ready for review, don't claim it's verified without it.
