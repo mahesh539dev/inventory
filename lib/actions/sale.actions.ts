@@ -2,9 +2,18 @@
 
 import { requireUser } from "@/lib/auth/guards";
 import { findProductByPublicIdentifier, findProductBySku } from "@/lib/repositories/product.repo";
-import { completeSale as completeSaleService, InsufficientInventoryError } from "@/lib/services/sale.service";
+import {
+  completeSale as completeSaleService,
+  InsufficientInventoryError,
+  returnSaleItems,
+  cancelSale,
+  SaleNotFoundError,
+  SaleNotCancellableError,
+  InvalidReturnQuantityError,
+} from "@/lib/services/sale.service";
 import { ProductNotFoundError } from "@/lib/services/product.service";
 import { completeSaleSchema } from "@/lib/validation/sale.schema";
+import { returnSaleItemsSchema, cancelSaleSchema } from "@/lib/validation/return.schema";
 
 export type ProductForSale = {
   id: string;
@@ -77,6 +86,50 @@ export async function completeSaleAction(input: {
     if (error instanceof ProductNotFoundError) {
       return { ok: false, error: error.message, productId: error.productId };
     }
+    throw error;
+  }
+}
+
+export type ReturnSaleItemsResult = { ok: true } | { ok: false; error: string };
+
+export async function returnSaleItemsAction(input: {
+  saleId: string;
+  items: { saleItemId: string; quantity: number }[];
+}): Promise<ReturnSaleItemsResult> {
+  const user = await requireUser();
+
+  const parsed = returnSaleItemsSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid return data" };
+  }
+
+  try {
+    await returnSaleItems({ saleId: parsed.data.saleId, userId: user.id, items: parsed.data.items });
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof InvalidReturnQuantityError) return { ok: false, error: error.message };
+    if (error instanceof SaleNotFoundError) return { ok: false, error: error.message };
+    if (error instanceof SaleNotCancellableError) return { ok: false, error: error.message };
+    throw error;
+  }
+}
+
+export type CancelSaleResult = { ok: true } | { ok: false; error: string };
+
+export async function cancelSaleAction(input: { saleId: string }): Promise<CancelSaleResult> {
+  const user = await requireUser();
+
+  const parsed = cancelSaleSchema.safeParse(input);
+  if (!parsed.success) {
+    return { ok: false, error: parsed.error.issues[0]?.message ?? "Invalid request" };
+  }
+
+  try {
+    await cancelSale({ saleId: parsed.data.saleId, userId: user.id });
+    return { ok: true };
+  } catch (error) {
+    if (error instanceof SaleNotFoundError) return { ok: false, error: error.message };
+    if (error instanceof SaleNotCancellableError) return { ok: false, error: error.message };
     throw error;
   }
 }
