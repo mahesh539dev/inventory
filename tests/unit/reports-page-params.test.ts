@@ -9,7 +9,7 @@ vi.mock("@/lib/repositories/sale.repo", () => ({
   getSalesBreakdownByCategory: vi.fn().mockResolvedValue([]),
 }));
 
-import { parseReportRange, parseGroupBy } from "@/app/(app)/reports/page";
+import { parseReportRange, parseGroupBy, toDateInputValue } from "@/app/(app)/reports/page";
 
 describe("parseReportRange", () => {
   const now = new Date("2026-01-15T12:00:00");
@@ -48,5 +48,20 @@ describe("parseGroupBy", () => {
 
   it("returns 'category' only when explicitly requested", () => {
     expect(parseGroupBy("category")).toBe("category");
+  });
+});
+
+describe("toDateInputValue", () => {
+  it("does not roll the date forward during evening hours in timezones west of UTC", () => {
+    // Regression test: toISOString() converts to UTC before formatting, so
+    // an evening local time can roll forward into the next UTC day. This
+    // must return the LOCAL calendar date, not the UTC one.
+    const eveningLocal = new Date(2026, 0, 15, 20, 30, 0, 0); // Jan 15, 8:30 PM local
+    expect(toDateInputValue(eveningLocal)).toBe("2026-01-15");
+  });
+
+  it("formats a plain local date as YYYY-MM-DD", () => {
+    const date = new Date(2026, 0, 5, 0, 0, 0, 0);
+    expect(toDateInputValue(date)).toBe("2026-01-05");
   });
 });

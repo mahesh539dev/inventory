@@ -53,8 +53,15 @@ export function parseGroupBy(groupBy: string | undefined): "product" | "category
   return groupBy === "category" ? "category" : "product";
 }
 
-function toDateInputValue(date: Date): string {
-  return date.toISOString().slice(0, 10);
+export function toDateInputValue(date: Date): string {
+  // Build the "YYYY-MM-DD" string from local-time getters rather than
+  // `toISOString()`, which converts to UTC first and can roll the date
+  // forward/backward a day in timezones west/east of UTC (e.g. evenings in
+  // US Eastern rolling forward into the next UTC day).
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 export default async function ReportsPage({
