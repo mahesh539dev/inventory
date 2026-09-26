@@ -1,6 +1,6 @@
 import { db } from "@/lib/db/client";
 import { sales, saleItems, products } from "@/lib/db/schema";
-import { eq, desc, count, asc, inArray, and, gte, lte, or, ilike, sql, sum, countDistinct, type SQL } from "drizzle-orm";
+import { eq, desc, count, asc, inArray, and, gte, lte, or, ilike, sql, countDistinct, type SQL } from "drizzle-orm";
 import type { DbOrTx } from "./inventory.repo";
 
 export type SaleRow = typeof sales.$inferSelect;
