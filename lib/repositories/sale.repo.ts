@@ -1,5 +1,5 @@
 import { db } from "@/lib/db/client";
-import { sales, saleItems, products } from "@/lib/db/schema";
+import { sales, saleItems, products, categories } from "@/lib/db/schema";
 import { eq, desc, count, asc, inArray, and, gte, lte, or, ilike, sql, countDistinct, type SQL } from "drizzle-orm";
 import type { DbOrTx } from "./inventory.repo";
 
@@ -184,4 +184,57 @@ export async function getSalesSummary(range: { from: Date; to: Date }): Promise<
     returnedCost: row.returnedCost,
     returnedProfit: row.returnedProfit,
   };
+}
+
+export type SalesBreakdownRow = {
+  id: string;
+  name: string;
+  unitsSold: number;
+  revenue: string;
+  cost: string;
+  profit: string;
+};
+
+export async function getSalesBreakdownByProduct(range: { from: Date; to: Date }): Promise<SalesBreakdownRow[]> {
+  const rows = await db
+    .select({
+      id: products.id,
+      name: products.productName,
+      unitsSold: sql<string>`coalesce(sum(${saleItems.quantity}), 0)`,
+      revenue: sql<string>`coalesce(sum(${saleItems.totalRevenue}), 0)`,
+      cost: sql<string>`coalesce(sum(${saleItems.totalCost}), 0)`,
+      profit: sql<string>`coalesce(sum(${saleItems.profit}), 0)`,
+    })
+    .from(saleItems)
+    .innerJoin(sales, eq(saleItems.saleId, sales.id))
+    .innerJoin(products, eq(saleItems.productId, products.id))
+    .where(and(gte(sales.soldAt, range.from), lte(sales.soldAt, range.to)))
+    .groupBy(products.id, products.productName)
+    .orderBy(desc(sql`sum(${saleItems.totalRevenue})`));
+
+  return rows.map((r) => ({ ...r, unitsSold: Number(r.unitsSold) }));
+}
+
+export async function getSalesBreakdownByCategory(range: { from: Date; to: Date }): Promise<SalesBreakdownRow[]> {
+  const categoryKey = sql<string>`coalesce(${categories.id}::text, 'uncategorized')`;
+  const categoryName = sql<string>`coalesce(${categories.name}, 'Uncategorized')`;
+
+  const rows = await db
+    .select({
+      id: categoryKey,
+      name: categoryName,
+      unitsSold: sql<string>`coalesce(sum(${saleItems.quantity}), 0)`,
+      revenue: sql<string>`coalesce(sum(${saleItems.totalRevenue}), 0)`,
+      cost: sql<string>`coalesce(sum(${saleItems.totalCost}), 0)`,
+      profit: sql<string>`coalesce(sum(${saleItems.profit}), 0)`,
+    })
+    .from(saleItems)
+    .innerJoin(sales, eq(saleItems.saleId, sales.id))
+    .innerJoin(products, eq(saleItems.productId, products.id))
+    .leftJoin(categories, eq(products.categoryId, categories.id))
+    .where(and(gte(sales.soldAt, range.from), lte(sales.soldAt, range.to)))
+    .groupBy(categoryKey, categoryName)
+    .orderBy(desc(sql`sum(${saleItems.totalRevenue})`));
+
+  return rows.map((r) => ({ ...r, unitsSold: Number(r.unitsSold) }));
 }

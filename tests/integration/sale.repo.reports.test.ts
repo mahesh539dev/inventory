@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { db } from "@/lib/db/client";
-import { sales, saleItems, products, users } from "@/lib/db/schema";
+import { sales, saleItems, products, users, categories } from "@/lib/db/schema";
 import { eq, inArray } from "drizzle-orm";
-import { insertSale, insertSaleItems, getSalesSummary } from "@/lib/repositories/sale.repo";
+import { insertSale, insertSaleItems, getSalesSummary, getSalesBreakdownByProduct, getSalesBreakdownByCategory } from "@/lib/repositories/sale.repo";
 
 async function makeUser() {
   const [user] = await db
@@ -194,5 +194,86 @@ describe("getSalesSummary", () => {
     expect(summary.unitsSold).toBe(0);
     expect(Number(summary.grossRevenue)).toBe(0);
     expect(Number(summary.returnedRevenue)).toBe(0);
+  });
+});
+
+describe("getSalesBreakdownByProduct / getSalesBreakdownByCategory", () => {
+  let userId: string;
+  let categorized: Awaited<ReturnType<typeof makeProduct>>;
+  let uncategorized: Awaited<ReturnType<typeof makeProduct>>;
+  let categoryId: string;
+  const IN_RANGE = new Date("2026-01-15T12:00:00Z");
+  const RANGE = { from: new Date("2026-01-01T00:00:00Z"), to: new Date("2026-01-31T23:59:59Z") };
+
+  beforeEach(async () => {
+    const user = await makeUser();
+    userId = user.id;
+    const [category] = await db.insert(categories).values({ name: `Cat-${crypto.randomUUID()}` }).returning();
+    categoryId = category.id;
+    categorized = await makeProduct({ productName: "Categorized Widget", categoryId });
+    uncategorized = await makeProduct({ productName: "Loose Widget" });
+  });
+
+  afterEach(async () => {
+    const testSales = await db.select({ id: sales.id }).from(sales).where(eq(sales.soldBy, userId));
+    const saleIds = testSales.map((s) => s.id);
+    if (saleIds.length > 0) {
+      await db.delete(saleItems).where(inArray(saleItems.saleId, saleIds));
+      await db.delete(sales).where(inArray(sales.id, saleIds));
+    }
+    await db.delete(products).where(inArray(products.id, [categorized.id, uncategorized.id]));
+    await db.delete(categories).where(eq(categories.id, categoryId));
+    await db.delete(users).where(eq(users.id, userId));
+  });
+
+  async function sellOneUnit(productId: string, sellingPrice: string, costPrice: string) {
+    const sale = await insertSale({
+      saleNumber: `TEST-${Math.random().toString(36).slice(2, 8)}`,
+      soldAt: IN_RANGE,
+      soldBy: userId,
+      totalAmount: sellingPrice,
+      totalCost: costPrice,
+      totalProfit: (Number(sellingPrice) - Number(costPrice)).toFixed(2),
+      status: "COMPLETED",
+    });
+    await insertSaleItems([{
+      saleId: sale.id,
+      productId,
+      quantity: 1,
+      costPerUnit: costPrice,
+      soldPricePerUnit: sellingPrice,
+      totalCost: costPrice,
+      totalRevenue: sellingPrice,
+      profit: (Number(sellingPrice) - Number(costPrice)).toFixed(2),
+    }]);
+  }
+
+  it("breaks down units/revenue/cost/profit per product, ordered by revenue descending", async () => {
+    await sellOneUnit(categorized.id, "50.00", "20.00");
+    await sellOneUnit(uncategorized.id, "10.00", "5.00");
+
+    const rows = await getSalesBreakdownByProduct(RANGE);
+    const relevant = rows.filter((r) => [categorized.id, uncategorized.id].includes(r.id));
+
+    expect(relevant[0].id).toBe(categorized.id); // higher revenue first
+    expect(relevant[0].name).toBe("Categorized Widget");
+    expect(relevant[0].unitsSold).toBe(1);
+    expect(Number(relevant[0].revenue)).toBeCloseTo(50.00);
+    expect(relevant[1].id).toBe(uncategorized.id);
+  });
+
+  it("groups by category, bucketing products with no categoryId under 'Uncategorized'", async () => {
+    await sellOneUnit(categorized.id, "50.00", "20.00");
+    await sellOneUnit(uncategorized.id, "10.00", "5.00");
+
+    const rows = await getSalesBreakdownByCategory(RANGE);
+
+    const namedCategory = rows.find((r) => r.id === categoryId);
+    expect(namedCategory).toBeDefined();
+    expect(Number(namedCategory!.revenue)).toBeCloseTo(50.00);
+
+    const uncategorizedRow = rows.find((r) => r.name === "Uncategorized");
+    expect(uncategorizedRow).toBeDefined();
+    expect(Number(uncategorizedRow!.revenue)).toBeCloseTo(10.00);
   });
 });
