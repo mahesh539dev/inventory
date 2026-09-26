@@ -26,7 +26,7 @@ export const inventoryTransactionTypeEnum = pgEnum("inventory_transaction_type",
   "DAMAGE",
   "OTHER",
 ]);
-export const saleStatusEnum = pgEnum("sale_status", ["COMPLETED", "CANCELLED", "RETURNED"]);
+export const saleStatusEnum = pgEnum("sale_status", ["COMPLETED", "CANCELLED", "PARTIALLY_RETURNED", "RETURNED"]);
 
 export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -117,6 +117,7 @@ export const saleItems = pgTable("sale_items", {
   totalCost: numeric("total_cost", { precision: 12, scale: 2 }).notNull(),
   totalRevenue: numeric("total_revenue", { precision: 12, scale: 2 }).notNull(),
   profit: numeric("profit", { precision: 12, scale: 2 }).notNull(),
+  returnedQuantity: integer("returned_quantity").notNull().default(0),
 }, (table) => [
   index("sale_items_sale_id_idx").on(table.saleId),
   index("sale_items_product_id_idx").on(table.productId),

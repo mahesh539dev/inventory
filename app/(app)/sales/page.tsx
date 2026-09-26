@@ -1,7 +1,9 @@
 import Link from "next/link";
 import { requireUser } from "@/lib/auth/guards";
 import { listSales, countSales } from "@/lib/repositories/sale.repo";
-import { findUserNamesByIds } from "@/lib/repositories/user.repo";
+import { findUserNamesByIds, listUsersForFilter } from "@/lib/repositories/user.repo";
+import { listProducts } from "@/lib/repositories/product.repo";
+import { SalesFilterBar } from "@/components/sales/SalesFilterBar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,20 +17,41 @@ import {
 
 const PAGE_SIZE = 25;
 
+type SalesSearchParams = {
+  page?: string;
+  q?: string;
+  status?: "COMPLETED" | "CANCELLED" | "PARTIALLY_RETURNED" | "RETURNED";
+  productId?: string;
+  userId?: string;
+  dateFrom?: string;
+  dateTo?: string;
+};
+
 export default async function SalesPage({
   searchParams,
 }: {
-  searchParams: Promise<{ page?: string }>;
+  searchParams: Promise<SalesSearchParams>;
 }) {
   await requireUser();
-  const { page: pageParam } = await searchParams;
+  const sp = await searchParams;
 
-  const page = Math.max(1, Number(pageParam) || 1);
+  const page = Math.max(1, Number(sp.page) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
-  const [salesList, total] = await Promise.all([
-    listSales({ limit: PAGE_SIZE, offset }),
-    countSales(),
+  const filterParams = {
+    query: sp.q,
+    status: sp.status,
+    productId: sp.productId,
+    userId: sp.userId,
+    dateFrom: sp.dateFrom ? new Date(sp.dateFrom) : undefined,
+    dateTo: sp.dateTo ? new Date(sp.dateTo) : undefined,
+  };
+
+  const [salesList, total, products, users] = await Promise.all([
+    listSales({ limit: PAGE_SIZE, offset, ...filterParams }),
+    countSales(filterParams),
+    listProducts({ limit: 500, offset: 0 }),
+    listUsersForFilter(),
   ]);
 
   const userIds = [...new Set(salesList.map((s) => s.soldBy))];
@@ -36,12 +59,33 @@ export default async function SalesPage({
 
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
+  const hasActiveFilters = Boolean(sp.q || sp.status || sp.productId || sp.userId || sp.dateFrom || sp.dateTo);
+
+  function pageHref(targetPage: number): string {
+    const params = new URLSearchParams();
+    if (sp.q) params.set("q", sp.q);
+    if (sp.status) params.set("status", sp.status);
+    if (sp.productId) params.set("productId", sp.productId);
+    if (sp.userId) params.set("userId", sp.userId);
+    if (sp.dateFrom) params.set("dateFrom", sp.dateFrom);
+    if (sp.dateTo) params.set("dateTo", sp.dateTo);
+    params.set("page", String(targetPage));
+    return `/sales?${params.toString()}`;
+  }
+
   return (
     <div className="p-4 space-y-4">
       <h1 className="text-2xl font-semibold">Sales</h1>
 
+      <SalesFilterBar
+        products={products.map((p) => ({ id: p.id, productName: p.productName }))}
+        users={users}
+      />
+
       {salesList.length === 0 ? (
-        <p className="text-muted-foreground">No sales yet.</p>
+        <p className="text-muted-foreground">
+          {hasActiveFilters ? "No sales match these filters." : "No sales yet."}
+        </p>
       ) : (
         <div className="overflow-x-auto rounded-md border">
           <Table>
@@ -84,10 +128,10 @@ export default async function SalesPage({
           </span>
           <div className="flex gap-2">
             {page > 1 && (
-              <Button variant="outline" size="sm" render={<Link href={`/sales?page=${page - 1}`}>Previous</Link>} />
+              <Button variant="outline" size="sm" render={<Link href={pageHref(page - 1)}>Previous</Link>} />
             )}
             {page < totalPages && (
-              <Button variant="outline" size="sm" render={<Link href={`/sales?page=${page + 1}`}>Next</Link>} />
+              <Button variant="outline" size="sm" render={<Link href={pageHref(page + 1)}>Next</Link>} />
             )}
           </div>
         </div>

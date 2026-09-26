@@ -12,6 +12,8 @@ vi.mock("@/lib/repositories/product.repo", () => ({
 
 vi.mock("@/lib/services/sale.service", () => ({
   completeSale: vi.fn(),
+  returnSaleItems: vi.fn(),
+  cancelSale: vi.fn(),
   InsufficientInventoryError: class InsufficientInventoryError extends Error {
     constructor(
       public readonly productId: string,
@@ -20,6 +22,30 @@ vi.mock("@/lib/services/sale.service", () => ({
     ) {
       super(`Insufficient inventory for product ${productId}: requested ${requested}, only ${available} available`);
       this.name = "InsufficientInventoryError";
+    }
+  },
+  SaleNotFoundError: class SaleNotFoundError extends Error {
+    constructor(public readonly saleId: string) {
+      super(`Sale not found: ${saleId}`);
+      this.name = "SaleNotFoundError";
+    }
+  },
+  SaleNotCancellableError: class SaleNotCancellableError extends Error {
+    constructor(public readonly saleId: string, public readonly currentStatus: string) {
+      super(`Sale ${saleId} cannot be cancelled (status: ${currentStatus})`);
+      this.name = "SaleNotCancellableError";
+    }
+  },
+  InvalidReturnQuantityError: class InvalidReturnQuantityError extends Error {
+    constructor(
+      public readonly saleItemId: string,
+      public readonly requested: number,
+      public readonly remaining: number
+    ) {
+      super(
+        `Invalid return quantity for sale item ${saleItemId}: requested ${requested}, only ${remaining} remaining`
+      );
+      this.name = "InvalidReturnQuantityError";
     }
   },
 }));
@@ -37,8 +63,16 @@ import { requireUser } from "@/lib/auth/guards";
 import { findProductByPublicIdentifier, findProductBySku, listProducts } from "@/lib/repositories/product.repo";
 import { completeSale } from "@/lib/services/sale.service";
 import { InsufficientInventoryError } from "@/lib/services/sale.service";
+import {
+  returnSaleItems,
+  cancelSale,
+  SaleNotFoundError,
+  SaleNotCancellableError,
+  InvalidReturnQuantityError,
+} from "@/lib/services/sale.service";
 import { ProductNotFoundError } from "@/lib/services/product.service";
 import { lookupProductForSale, completeSaleAction } from "@/lib/actions/sale.actions";
+import { returnSaleItemsAction, cancelSaleAction } from "@/lib/actions/sale.actions";
 import { searchProductsForSale } from "@/lib/actions/product-search.actions";
 
 const sessionUser = { id: "user-1", role: "USER" as const, email: "a@example.com" };
@@ -274,5 +308,78 @@ describe("searchProductsForSale", () => {
 
     expect(results).toEqual([]);
     expect(listProducts).not.toHaveBeenCalled();
+  });
+});
+
+describe("returnSaleItemsAction", () => {
+  beforeEach(() => {
+    vi.mocked(requireUser).mockReset();
+    vi.mocked(returnSaleItems).mockReset();
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+  });
+
+  it("returns ok:true on success", async () => {
+    vi.mocked(returnSaleItems).mockResolvedValue({ id: "sale-1" } as never);
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-4111-8111-111111111111", items: [{ saleItemId: "22222222-2222-4222-8222-222222222222", quantity: 1 }] });
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("returns ok:false with a validation message for malformed input", async () => {
+    const result = await returnSaleItemsAction({ saleId: "not-a-uuid", items: [] });
+    expect(result.ok).toBe(false);
+  });
+
+  it("maps InvalidReturnQuantityError to ok:false", async () => {
+    vi.mocked(returnSaleItems).mockRejectedValue(new InvalidReturnQuantityError("item-1", 5, 2));
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-4111-8111-111111111111", items: [{ saleItemId: "22222222-2222-4222-8222-222222222222", quantity: 5 }] });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("maps SaleNotFoundError to ok:false", async () => {
+    vi.mocked(returnSaleItems).mockRejectedValue(new SaleNotFoundError("sale-1"));
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-4111-8111-111111111111", items: [{ saleItemId: "22222222-2222-4222-8222-222222222222", quantity: 1 }] });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("does not throw for an unmapped SaleNotCancellableError-style rejection on return (defensive)", async () => {
+    vi.mocked(returnSaleItems).mockRejectedValue(new SaleNotCancellableError("sale-1", "CANCELLED"));
+    const result = await returnSaleItemsAction({ saleId: "11111111-1111-4111-8111-111111111111", items: [{ saleItemId: "22222222-2222-4222-8222-222222222222", quantity: 1 }] });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("calls requireUser before performing the return", async () => {
+    await returnSaleItemsAction({ saleId: "11111111-1111-4111-8111-111111111111", items: [{ saleItemId: "22222222-2222-4222-8222-222222222222", quantity: 1 }] });
+    expect(requireUser).toHaveBeenCalled();
+  });
+});
+
+describe("cancelSaleAction", () => {
+  beforeEach(() => {
+    vi.mocked(requireUser).mockReset();
+    vi.mocked(cancelSale).mockReset();
+    vi.mocked(requireUser).mockResolvedValue(sessionUser);
+  });
+
+  it("returns ok:true on success", async () => {
+    vi.mocked(cancelSale).mockResolvedValue({ id: "sale-1" } as never);
+    const result = await cancelSaleAction({ saleId: "11111111-1111-4111-8111-111111111111" });
+    expect(result).toEqual({ ok: true });
+  });
+
+  it("maps SaleNotCancellableError to ok:false", async () => {
+    vi.mocked(cancelSale).mockRejectedValue(new SaleNotCancellableError("sale-1", "PARTIALLY_RETURNED"));
+    const result = await cancelSaleAction({ saleId: "11111111-1111-4111-8111-111111111111" });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("maps SaleNotFoundError to ok:false", async () => {
+    vi.mocked(cancelSale).mockRejectedValue(new SaleNotFoundError("sale-1"));
+    const result = await cancelSaleAction({ saleId: "11111111-1111-4111-8111-111111111111" });
+    expect(result).toEqual({ ok: false, error: expect.any(String) });
+  });
+
+  it("returns ok:false for malformed input", async () => {
+    const result = await cancelSaleAction({ saleId: "not-a-uuid" });
+    expect(result.ok).toBe(false);
   });
 });
