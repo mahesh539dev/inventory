@@ -33,7 +33,7 @@
 ## File Structure
 
 - `lib/repositories/sale.repo.ts` (modify) — add `getSalesSummary`, `getSalesBreakdownByProduct`, `getSalesBreakdownByCategory`. Same file as all other sale-related aggregate/list queries (`listSales`, `countSales`) — keeps sale-domain queries together per existing convention.
-- `lib/repositories/product.repo.ts` (modify) — add `listLowStockProducts`. Filters `products` directly with no join, so it belongs with the other plain-`products`-table queries in this file rather than `inventory.repo.ts` (which is scoped to `inventory_transactions`).
+- ~~`lib/repositories/product.repo.ts` (modify) — add `listLowStockProducts`~~ **Superseded during Task 3's review**: a `listLowStockProducts(threshold, {limit, offset})` function already existed in `lib/repositories/inventory.repo.ts` since Phase 4 and does everything needed; Task 3's new duplicate was removed. Task 5 calls the pre-existing `inventory.repo.ts` version directly. No change needed to `product.repo.ts` for this phase.
 - `app/(app)/dashboard/page.tsx` (rewrite) — server component, no search params.
 - `app/(app)/reports/page.tsx` (new) — server component, reads `searchParams`.
 - `components/dashboard/SummaryTiles.tsx` (new) — presentational, shared by both pages.
@@ -970,7 +970,7 @@ git commit -m "Add SummaryTiles, RecentSalesList, LowStockList components"
 - Test: `tests/unit/dashboard-page-ranges.test.ts` (pure date-range helper, extracted for testability)
 
 **Interfaces:**
-- Consumes: `requireUser` from `lib/auth/guards.ts`; `getSalesSummary` from `lib/repositories/sale.repo.ts`; `listSales` from `lib/repositories/sale.repo.ts`; `listLowStockProducts` from `lib/repositories/product.repo.ts`; `SummaryTiles`, `RecentSalesList`, `LowStockList` from Task 4.
+- Consumes: `requireUser` from `lib/auth/guards.ts`; `getSalesSummary` from `lib/repositories/sale.repo.ts`; `listSales` from `lib/repositories/sale.repo.ts`; `listLowStockProducts` from `lib/repositories/inventory.repo.ts` (**correction, ruled during Task 3's review**: this function already existed from Phase 4 with signature `listLowStockProducts(threshold: number, params: { limit: number; offset: number }): Promise<ProductRow[]>` — filters `ACTIVE` + `currentQuantity <= threshold`, ordered ascending. Task 3 was redundant and its duplicate was removed; call the pre-existing one directly as `listLowStockProducts(LOW_STOCK_THRESHOLD, { limit: 10, offset: 0 })`, importing `LOW_STOCK_THRESHOLD` from `lib/constants.ts`); `SummaryTiles`, `RecentSalesList`, `LowStockList` from Task 4.
 - Produces: the rendered `/dashboard` route. Also produces a small exported helper (used only within this task, but exported for direct unit testing without rendering the page):
   ```ts
   export function getTodayRange(now: Date): { from: Date; to: Date };
@@ -1019,7 +1019,8 @@ Replace `app/(app)/dashboard/page.tsx` entirely:
 ```tsx
 import { requireUser } from "@/lib/auth/guards";
 import { getSalesSummary, listSales } from "@/lib/repositories/sale.repo";
-import { listLowStockProducts } from "@/lib/repositories/product.repo";
+import { listLowStockProducts } from "@/lib/repositories/inventory.repo";
+import { LOW_STOCK_THRESHOLD } from "@/lib/constants";
 import { SummaryTiles } from "@/components/dashboard/SummaryTiles";
 import { RecentSalesList } from "@/components/dashboard/RecentSalesList";
 import { LowStockList } from "@/components/dashboard/LowStockList";
@@ -1043,7 +1044,7 @@ export default async function DashboardPage() {
     getSalesSummary(getTodayRange(now)),
     getSalesSummary(getMonthToDateRange(now)),
     listSales({ limit: 10, offset: 0 }),
-    listLowStockProducts(10),
+    listLowStockProducts(LOW_STOCK_THRESHOLD, { limit: 10, offset: 0 }),
   ]);
 
   return (
