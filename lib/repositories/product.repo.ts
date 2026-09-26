@@ -1,6 +1,7 @@
 import { db } from "@/lib/db/client";
 import { products } from "@/lib/db/schema";
-import { and, eq, ilike, or, count } from "drizzle-orm";
+import { and, eq, ilike, or, count, lte, asc } from "drizzle-orm";
+import { LOW_STOCK_THRESHOLD } from "@/lib/constants";
 
 export type ProductRow = typeof products.$inferSelect;
 export type NewProduct = typeof products.$inferInsert;
@@ -124,4 +125,13 @@ export async function countProducts(
     .from(products)
     .where(buildFilters(params));
   return value;
+}
+
+export async function listLowStockProducts(limit: number): Promise<ProductRow[]> {
+  return db
+    .select()
+    .from(products)
+    .where(and(eq(products.status, "ACTIVE"), lte(products.currentQuantity, LOW_STOCK_THRESHOLD)))
+    .orderBy(asc(products.currentQuantity))
+    .limit(limit);
 }
