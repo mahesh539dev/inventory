@@ -56,7 +56,7 @@ export function ReportsDateRangeFilter({
         <select
           id="report-groupby"
           className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
-          defaultValue={defaultGroupBy}
+          value={searchParams.get("groupBy") ?? defaultGroupBy}
           onChange={(e) => navigate({ groupBy: e.target.value || undefined })}
         >
           <option value="product">Product</option>
