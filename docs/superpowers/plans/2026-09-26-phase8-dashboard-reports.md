@@ -981,8 +981,22 @@ git commit -m "Add SummaryTiles, RecentSalesList, LowStockList components"
 
 Create `tests/unit/dashboard-page-ranges.test.ts`:
 
+**Correction (ruled during Task 5's fix loop):** importing the page module directly, unmocked, drags in its real `requireUser -> getSessionUser -> @/auth -> next-auth -> next/server` chain, which vitest's node environment cannot resolve (`Cannot find module '.../next/server'`). Every existing page-test in this repo (e.g. `tests/unit/guards.test.ts`, `tests/unit/sell.page.test.tsx`) mocks dependencies BEFORE importing anything that touches them — follow that same pattern here.
+
 ```ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+vi.mock("@/lib/auth/guards", () => ({
+  requireUser: vi.fn().mockResolvedValue({ id: "1", email: "test@example.com", role: "USER" }),
+}));
+vi.mock("@/lib/repositories/sale.repo", () => ({
+  getSalesSummary: vi.fn(),
+  listSales: vi.fn().mockResolvedValue([]),
+}));
+vi.mock("@/lib/repositories/inventory.repo", () => ({
+  listLowStockProducts: vi.fn().mockResolvedValue([]),
+}));
+
 import { getTodayRange, getMonthToDateRange } from "@/app/(app)/dashboard/page";
 
 describe("getTodayRange", () => {
@@ -1254,9 +1268,14 @@ export function ReportsDateRangeFilter({
         <select
           id="report-groupby"
           className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
-          defaultValue={defaultGroupBy}
+          value={searchParams.get("groupBy") ?? defaultGroupBy}
           onChange={(e) => navigate({ groupBy: e.target.value || undefined })}
         >
+          {/* Correction (ruled during Task 6's review): controlled from
+              searchParams, matching SalesFilterBar's selects — an
+              uncontrolled defaultValue here goes stale on Next.js soft
+              navigation (back/forward) since this client component doesn't
+              remount when only searchParams change. */}
           <option value="product">Product</option>
           <option value="category">Category</option>
         </select>
@@ -1351,8 +1370,20 @@ git commit -m "Add ReportsDateRangeFilter and BreakdownTable components"
 
 Create `tests/unit/reports-page-params.test.ts`:
 
+**Same correction as Task 5:** mock dependencies before importing the page module, or the real `next-auth` chain fails to resolve in vitest's node environment.
+
 ```ts
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
+
+vi.mock("@/lib/auth/guards", () => ({
+  requireUser: vi.fn().mockResolvedValue({ id: "1", email: "test@example.com", role: "USER" }),
+}));
+vi.mock("@/lib/repositories/sale.repo", () => ({
+  getSalesSummary: vi.fn(),
+  getSalesBreakdownByProduct: vi.fn().mockResolvedValue([]),
+  getSalesBreakdownByCategory: vi.fn().mockResolvedValue([]),
+}));
+
 import { parseReportRange, parseGroupBy } from "@/app/(app)/reports/page";
 
 describe("parseReportRange", () => {

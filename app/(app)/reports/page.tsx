@@ -18,7 +18,10 @@ function startOfMonth(now: Date): Date {
   return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
 }
 
-function parseDate(value: string | undefined): Date | null {
+function parseDate(
+  value: string | undefined,
+  boundary: "start" | "end" = "start"
+): Date | null {
   if (!value) return null;
 
   // Parse "YYYY-MM-DD" as local time (not UTC) so the calendar date is
@@ -28,7 +31,16 @@ function parseDate(value: string | undefined): Date | null {
   const isoDateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
   if (isoDateMatch) {
     const [, year, month, day] = isoDateMatch;
-    const parsed = new Date(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
+    // A date-only string is a whole-day boundary: "start" means local
+    // midnight at the beginning of that day, "end" means the last
+    // millisecond of that day (23:59:59.999 local) — matching the
+    // end-of-day convention used by getTodayRange in the dashboard page.
+    // Without this, a `to` bound parsed as start-of-day would exclude
+    // every sale on the named day from an inclusive `lte` comparison.
+    const parsed =
+      boundary === "end"
+        ? new Date(Number(year), Number(month) - 1, Number(day), 23, 59, 59, 999)
+        : new Date(Number(year), Number(month) - 1, Number(day), 0, 0, 0, 0);
     return Number.isNaN(parsed.getTime()) ? null : parsed;
   }
 
@@ -36,15 +48,39 @@ function parseDate(value: string | undefined): Date | null {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function endOfDayOf(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 23, 59, 59, 999);
+}
+
+function startOfDayOf(date: Date): Date {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0);
+}
+
 export function parseReportRange(
   params: { from?: string; to?: string },
   now: Date
 ): { from: Date; to: Date } {
-  const parsedFrom = parseDate(params.from) ?? startOfMonth(now);
-  const parsedTo = parseDate(params.to) ?? now;
+  // `from` defaults to start-of-month, and is parsed as start-of-day when
+  // given as a date-only string. `to` defaults to `now` (a precise instant
+  // that must NOT be pushed to end-of-day), and is parsed as end-of-day
+  // when given as a date-only string — otherwise an inclusive `lte`
+  // comparison against `to` would exclude every sale on the named day.
+  const wasFromDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(params.from ?? "");
+  const wasToDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(params.to ?? "");
+
+  const parsedFrom = parseDate(params.from, "start") ?? startOfMonth(now);
+  const parsedTo = parseDate(params.to, "end") ?? now;
 
   if (parsedFrom.getTime() > parsedTo.getTime()) {
-    return { from: parsedTo, to: parsedFrom };
+    // Swap positions. Whichever value now occupies `to` must be
+    // end-of-day if it originated from a date-only string (it may
+    // currently be start-of-day, since it was originally parsed as
+    // `from`); likewise whichever now occupies `from` must be
+    // start-of-day. Values that defaulted (startOfMonth/now) are already
+    // correct in either position and are left untouched.
+    const newTo = wasFromDateOnly ? endOfDayOf(parsedFrom) : parsedFrom;
+    const newFrom = wasToDateOnly ? startOfDayOf(parsedTo) : parsedTo;
+    return { from: newFrom, to: newTo };
   }
   return { from: parsedFrom, to: parsedTo };
 }

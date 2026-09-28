@@ -35,7 +35,7 @@ export function ReportsDateRangeFilter({
           id="report-from"
           type="date"
           className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
-          defaultValue={defaultFrom}
+          value={searchParams.get("from") ?? defaultFrom}
           onChange={(e) => navigate({ from: e.target.value || undefined })}
         />
       </div>
@@ -46,7 +46,7 @@ export function ReportsDateRangeFilter({
           id="report-to"
           type="date"
           className="block h-8 rounded-lg border border-input bg-transparent px-2 text-sm"
-          defaultValue={defaultTo}
+          value={searchParams.get("to") ?? defaultTo}
           onChange={(e) => navigate({ to: e.target.value || undefined })}
         />
       </div>

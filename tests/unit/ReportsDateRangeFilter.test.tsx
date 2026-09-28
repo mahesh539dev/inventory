@@ -5,14 +5,16 @@ import "@testing-library/jest-dom/vitest";
 import { ReportsDateRangeFilter } from "@/components/reports/ReportsDateRangeFilter";
 
 const mockPush = vi.fn();
+let mockSearchParams = new URLSearchParams();
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mockPush }),
-  useSearchParams: () => new URLSearchParams(),
+  useSearchParams: () => mockSearchParams,
 }));
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  mockSearchParams = new URLSearchParams();
 });
 
 describe("ReportsDateRangeFilter", () => {
@@ -33,5 +35,16 @@ describe("ReportsDateRangeFilter", () => {
     render(<ReportsDateRangeFilter defaultFrom="2026-01-01" defaultTo="2026-01-31" defaultGroupBy="product" />);
     fireEvent.change(screen.getByLabelText(/group by/i), { target: { value: "category" } });
     expect(mockPush).toHaveBeenCalledWith(expect.stringContaining("groupBy=category"));
+  });
+
+  it("reflects the current from/to search params instead of staying pinned to stale defaults", () => {
+    // Regression test: these inputs used to be uncontrolled (defaultValue),
+    // so on a searchParams-only navigation (e.g. back/forward, or the
+    // silent from/to swap) React would never update the displayed value
+    // even though the `defaultFrom`/`defaultTo` props changed.
+    mockSearchParams = new URLSearchParams("from=2026-03-05&to=2026-03-20");
+    render(<ReportsDateRangeFilter defaultFrom="2026-01-01" defaultTo="2026-01-31" defaultGroupBy="product" />);
+    expect(screen.getByLabelText(/from/i)).toHaveValue("2026-03-05");
+    expect(screen.getByLabelText(/to/i)).toHaveValue("2026-03-20");
   });
 });

@@ -38,6 +38,32 @@ describe("parseReportRange", () => {
     expect(from.getDate()).toBe(5);
     expect(to.getDate()).toBe(20);
   });
+
+  it("produces an end-of-day `to` for a one-day report so same-day sales aren't excluded", () => {
+    const { from, to } = parseReportRange({ from: "2026-01-10", to: "2026-01-10" }, now);
+    expect(to.getHours()).toBe(23);
+    expect(to.getMinutes()).toBe(59);
+    expect(to.getSeconds()).toBe(59);
+    expect(to.getTime()).toBeGreaterThan(from.getTime());
+  });
+
+  it("keeps `to` end-of-day after a from/to swap", () => {
+    const { from, to } = parseReportRange({ from: "2026-01-20", to: "2026-01-05" }, now);
+    // from="2026-01-20" ends up as the final `to` after swapping (since
+    // to="2026-01-05" is earlier), and must be end-of-day, not the
+    // start-of-day value it would have had if left un-adjusted after swap.
+    expect(to.getDate()).toBe(20);
+    expect(to.getHours()).toBe(23);
+    expect(to.getMinutes()).toBe(59);
+    expect(to.getSeconds()).toBe(59);
+    expect(from.getDate()).toBe(5);
+    expect(from.getHours()).toBe(0);
+  });
+
+  it("leaves the default `to` (now) unaffected when the to param is absent", () => {
+    const { to } = parseReportRange({ from: "2026-01-01" }, now);
+    expect(to.getTime()).toBe(now.getTime());
+  });
 });
 
 describe("parseGroupBy", () => {
